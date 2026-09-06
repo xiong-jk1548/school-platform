@@ -1,0 +1,17 @@
+# 前端项目（Windows 下 npm ci 依赖大，node_modules 通常已在本地）
+frontend/node_modules
+frontend/dist
+frontend/.vite
+frontend/src/auto-imports.d.ts
+frontend/src/components.d.ts
+frontend/*.log
+
+# Git / IDE
+.git
+.idea
+.vscode
+*.md.bak
+
+# Python start.py 的缓存
+__pycache__/
+*.pyc

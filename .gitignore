@@ -1,0 +1,49 @@
+# ============ 敏感密钥（绝对禁止提交） ============
+.env
+.env.local
+.env.production
+.env.*.local
+frontend/.env.local
+
+# ============ 备份 / 数据库数据（数据不能上 GitHub）============
+deploy-backup-*.tar.gz
+deploy-backup-*.zip
+*.sql.bak
+db-volume.tar.gz
+
+# ============ Docker（数据卷不提交）============
+docker-data/
+postgres-data/
+
+# ============ Build 产物 ============
+frontend/dist
+frontend/node_modules
+frontend/.vite
+frontend/src/auto-imports.d.ts
+frontend/src/components.d.ts
+
+# ============ IDE ============
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ============ OS ============
+Thumbs.db
+.DS_Store
+ehthumbs.db
+Desktop.ini
+
+# ============ Python ============
+__pycache__/
+*.pyc
+*.pyo
+
+# ============ Logs ============
+*.log
+npm-debug.log*
+
+# ============ Misc ============
+*.tar.gz
+*.zip

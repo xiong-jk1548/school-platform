@@ -1,0 +1,135 @@
+# ============================================================
+# 一键部署：Supabase 自托管后端 + Nginx 前端
+# 使用步骤：
+#   1. 在项目根目录复制 .env.example 为 .env，改好密钥（至少替换 POSTGRES_PASSWORD + JWT_SECRET）
+#   2. docker compose -p school-platform up -d --build
+#   3. 浏览器打开 http://服务器IP:8080  ← 前端（默认 mock 模式演示用）
+#      浏览器打开 http://服务器IP:8000  ← Supabase Dashboard（SQL 编辑器）
+#   4. 进入 Dashboard → SQL Editor，粘贴 docker/init/01_schema.sql 执行
+#   5. 创建初始账号：在 Auth Users 里 add user（或 SQL：参考 02_features_v2.sql）
+#
+# 停止：   docker compose -p school-platform down
+# 查看日志：docker compose -p school-platform logs -f web
+# 前端重建：docker compose -p school-platform up -d --build web
+# ============================================================
+
+services:
+  # ---------------- 前端（Vue3 + Nginx） ----------------
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: school-web
+    restart: unless-stopped
+    # 前端默认用 mock 模式（数据在浏览器里），改走真后端需同时：
+    #   1) 浏览器 console: localStorage.setItem('USE_MOCK', 'false')
+    #   2) 前端 .env.production 设 VITE_USE_REAL_SUPABASE=true + URL + ANON_KEY
+    environment:
+      - VITE_SUPABASE_URL=http://supabase-kong:8000
+      - VITE_SUPABASE_ANON_KEY=${SUPABASE_ANON_KEY}
+      - VITE_USE_REAL_SUPABASE=false
+    ports:
+      - "8080:80"
+    depends_on:
+      - kong
+    networks:
+      - frontend
+      - supabase
+
+  # ---------------- Supabase 后端（精简 5 服务） ----------------
+  db:
+    container_name: supabase-db
+    image: postgres:15-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: supabase
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: postgres
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - supabase-db-data:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U supabase -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - supabase
+
+  rest:
+    container_name: supabase-rest
+    image: postgrest/postgrest:v12.2.12
+    restart: unless-stopped
+    depends_on:
+      db: { condition: service_healthy }
+    environment:
+      PGRST_DB_URI: postgres://supabase:${POSTGRES_PASSWORD}@db:5432/postgres
+      PGRST_DB_SCHEMAS: public,storage,graphql_public
+      PGRST_DB_ANON_ROLE: anon
+      PGRST_JWT_SECRET: ${JWT_SECRET}
+      PGRST_APP_SETTINGS_JWT_SECRET: ${JWT_SECRET}
+      PGRST_APP_SETTINGS_JWT_EXP: 3600
+    networks:
+      - supabase
+
+  auth:
+    container_name: supabase-auth
+    image: supabase/gotrue:v2.160.0
+    restart: unless-stopped
+    depends_on:
+      db: { condition: service_healthy }
+    environment:
+      GOTRUE_DB_DRIVER: postgres
+      GOTRUE_DATABASE_URL: postgres://supabase:${POSTGRES_PASSWORD}@db:5432/postgres?sslmode=disable
+      GOTRUE_SITE_URL: ${SITE_URL}
+      GOTRUE_JWT_SECRET: ${JWT_SECRET}
+      GOTRUE_JWT_EXP: 3600
+      GOTRUE_JWT_AUD: authenticated
+      GOTRUE_ANON_KEY: ${SUPABASE_ANON_KEY}
+      GOTRUE_SERVICE_ROLE_KEY: ${SUPABASE_SERVICE_ROLE_KEY}
+      GOTRUE_PASSWORD_MIN_LENGTH: 6
+      GOTRUE_MAILER_AUTOCONFIRM: "true"
+      GOTRUE_MAILER_EMAIL_CONFIRMATION_REQUIRED: "false"
+      GOTRUE_SMTP_ADMIN_EMAIL: admin@example.com
+      GOTRUE_SMTP_HOST: 127.0.0.1
+      GOTRUE_SMTP_PORT: 25
+      GOTRUE_SMTP_USER: ""
+      GOTRUE_SMTP_PASS: ""
+      GOTRUE_SMTP_SENDER_NAME: "Supabase Auth"
+      GOTRUE_SMTP_SENDER_EMAIL: "admin@example.com"
+    networks:
+      - supabase
+
+  kong:
+    container_name: supabase-kong
+    image: kong:2.8.1
+    restart: unless-stopped
+    depends_on: [rest, auth]
+    environment:
+      KONG_DATABASE: "off"
+      KONG_DECLARATIVE_CONFIG: /tmp/kong.yml
+      KONG_PROXY_ACCESS_LOG: /dev/stdout
+      KONG_ADMIN_ACCESS_LOG: /dev/stdout
+      KONG_PROXY_ERROR_LOG: /dev/stderr
+      KONG_ADMIN_ERROR_LOG: /dev/stderr
+      KONG_ADMIN_LISTEN: "off"
+    volumes:
+      - ./docker/kong.yml:/tmp/kong.yml:ro
+    # 局域网开放 8000 端口 —— 前端需要从这里访问 REST / Auth API
+    ports:
+      - "8000:8000"
+      - "8443:8443"
+    networks:
+      - frontend
+      - supabase
+
+volumes:
+  supabase-db-data:
+
+networks:
+  frontend:
+    driver: bridge
+  supabase:
+    driver: bridge

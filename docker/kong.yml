@@ -1,0 +1,34 @@
+# ============================================================
+# Kong 声明式配置 —— Supabase 各服务路由到统一端口
+# 被 docker-compose.yml 中的 kong 服务引用
+# ============================================================
+
+_format_version: '2.1'
+
+services:
+  - name: auth
+    url: http://auth:8080
+    routes:
+      - name: auth
+        paths:
+          - /auth
+        strip_path: true
+        preserve_host: true
+
+  - name: rest
+    url: http://rest:3000
+    routes:
+      - name: rest
+        paths:
+          - /rest
+        strip_path: true
+        preserve_host: true
+
+  - name: storage
+    url: http://storage:5000
+    routes:
+      - name: storage
+        paths:
+          - /storage
+        strip_path: true
+        preserve_host: true
