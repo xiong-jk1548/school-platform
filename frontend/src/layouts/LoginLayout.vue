@@ -11,35 +11,47 @@ const router = useRouter()
 const route = useRoute()
 const userStore = useUserStore()
 
-const formRef = ref<FormInstance>()
-const isSubmitting = ref(false)
+const loginFormRef = ref<FormInstance>()
+const loginSubmitting = ref(false)
 
-interface LoginForm {
-  email: string
+/** 登录表单字段；account 兼收手机号与邮箱，具体走哪种由内容形态判断 */
+interface LoginCredentials {
+  account: string
   password: string
 }
 
-const form = reactive<LoginForm>({
-  email: '',
+const credentials = reactive<LoginCredentials>({
+  account: '',
   password: '',
 })
 
-const rules = reactive<FormRules<LoginForm>>({
-  email: [
-    { required: true, message: '请输入手机号', trigger: 'blur' },
+const loginFormRules = reactive<FormRules<LoginCredentials>>({
+  account: [
+    { required: true, message: '请输入手机号或邮箱', trigger: 'blur' },
   ],
   password: [{ required: true, message: '请输入密码', trigger: 'blur' }],
 })
 
-async function handleSubmit() {
-  const valid = await formRef.value?.validate().catch(() => false)
-  if (!valid) return
-  isSubmitting.value = true
+/**
+ * 提交登录：按账号形态二选一走 Supabase 密码登录，成功后同步用户档案并跳转。
+ * @returns Promise<void>，校验不通过或登录失败时提前返回
+ *
+ * 坑：早期版本这里恒传 { email }，导致用手机号建的账号必然登录失败——
+ * gotrue 本身支持 { phone, password }，纯粹是前端漏了分支。
+ */
+async function submitLogin() {
+  const isValid = await loginFormRef.value?.validate().catch(() => false)
+  if (!isValid) return
+  loginSubmitting.value = true
   try {
-    const { error } = await supabase.auth.signInWithPassword({
-      email: form.email,
-      password: form.password,
-    })
+    // 输入为 11 位纯数字手机号时走 phone 登录，否则按邮箱处理
+    const accountInput = credentials.account.trim()
+    const isPhoneAccount = /^\d{11}$/.test(accountInput)
+    const { error } = await supabase.auth.signInWithPassword(
+      isPhoneAccount
+        ? { phone: accountInput, password: credentials.password }
+        : { email: accountInput, password: credentials.password },
+    )
     if (error) throw error
     await userStore.syncFromSession()
     ElMessage.success('登录成功')
@@ -48,80 +60,61 @@ async function handleSubmit() {
   } catch (err: unknown) {
     ElMessage.error(err instanceof Error ? err.message : '登录失败')
   } finally {
-    isSubmitting.value = false
+    loginSubmitting.value = false
   }
 }
 
-const testAccounts = [
-  { role: '教育局管理员', phone: '13800000001', password: '123456' },
-  { role: '学校管理员', phone: '13800000002', password: '123456' },
-  { role: '教师', phone: '13800000003', password: '123456' },
-]
 </script>
 
 <template>
-  <div class="login-container">
-    <div class="login-card">
-      <h1 class="login-title">校园信息化服务平台</h1>
-      <p class="login-subtitle">面向教师 · 班级数字化管理</p>
+  <div class="platform-login-page">
+    <div class="platform-login-card">
+      <h1 class="platform-login-title">智慧校园管理平台</h1>
+      <p class="platform-login-subtitle">面向教师 · 班级数字化管理</p>
 
       <el-form
-        ref="formRef"
-        :model="form"
-        :rules="rules"
+        ref="loginFormRef"
+        :model="credentials"
+        :rules="loginFormRules"
         label-position="top"
         size="large"
-        @submit.prevent="handleSubmit"
+        @submit.prevent="submitLogin"
       >
-        <el-form-item label="手机号" prop="email">
+        <el-form-item label="手机号 / 邮箱" prop="account">
           <el-input
-            v-model="form.email"
+            v-model="credentials.account"
             type="text"
-            placeholder="请输入手机号"
+            placeholder="请输入手机号或邮箱"
             :prefix-icon="User"
             autocomplete="username"
           />
         </el-form-item>
         <el-form-item label="密码" prop="password">
           <el-input
-            v-model="form.password"
+            v-model="credentials.password"
             type="password"
             placeholder="请输入密码"
             :prefix-icon="Lock"
             show-password
             autocomplete="current-password"
-            @keyup.enter="handleSubmit"
+            @keyup.enter="submitLogin"
           />
         </el-form-item>
         <el-button
           type="primary"
-          :loading="isSubmitting"
-          class="login-btn"
-          @click="handleSubmit"
+          :loading="loginSubmitting"
+          class="platform-login-submit"
+          @click="submitLogin"
         >
           登 录
         </el-button>
       </el-form>
-
-      <div class="test-hint">
-        <div class="test-hint-title">测试账号</div>
-        <div
-          v-for="acc in testAccounts"
-          :key="acc.phone"
-          class="test-hint-row"
-        >
-          <span class="role-tag">{{ acc.role }}</span>
-          <span class="cred">
-            {{ acc.phone }} / {{ acc.password }}
-          </span>
-        </div>
-      </div>
     </div>
   </div>
 </template>
 
 <style scoped>
-.login-container {
+.platform-login-page {
   min-height: 100vh;
   display: flex;
   align-items: center;
@@ -130,7 +123,7 @@ const testAccounts = [
   padding: 24px;
 }
 
-.login-card {
+.platform-login-card {
   width: 100%;
   max-width: 440px;
   padding: 40px 36px 32px;
@@ -139,7 +132,7 @@ const testAccounts = [
   box-shadow: 0 20px 40px rgba(30, 111, 217, 0.25);
 }
 
-.login-title {
+.platform-login-title {
   margin: 0;
   font-size: 22px;
   font-weight: 600;
@@ -147,59 +140,22 @@ const testAccounts = [
   text-align: center;
 }
 
-.login-subtitle {
+.platform-login-subtitle {
   margin: 8px 0 28px;
   font-size: 14px;
   color: #8892a4;
   text-align: center;
 }
 
-.login-btn {
+.platform-login-submit {
   width: 100%;
   margin-top: 12px;
   background: #1e6fd9;
   border-color: #1e6fd9;
 }
 
-.login-btn:hover {
+.platform-login-submit:hover {
   background: #185bb5;
   border-color: #185bb5;
-}
-
-.test-hint {
-  margin-top: 24px;
-  padding-top: 16px;
-  border-top: 1px dashed #dcdfe6;
-  font-size: 12px;
-  color: #909399;
-}
-
-.test-hint-title {
-  font-weight: 600;
-  margin-bottom: 8px;
-  color: #606266;
-}
-
-.test-hint-row {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  margin-bottom: 4px;
-}
-
-.role-tag {
-  display: inline-block;
-  min-width: 72px;
-  padding: 1px 8px;
-  font-size: 11px;
-  color: #1e6fd9;
-  background: #eaf3ff;
-  border-radius: 10px;
-  text-align: center;
-}
-
-.cred {
-  font-family: 'Courier New', monospace;
-  color: #606266;
 }
 </style>

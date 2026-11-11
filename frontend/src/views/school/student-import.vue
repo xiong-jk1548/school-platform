@@ -32,35 +32,49 @@ const uploading = ref(false)
 const parsedRows = ref<ParsedStudent[]>([])
 const importResult = ref<ImportResult | null>(null)
 
+/**
+ * 加载本校班级，作为「目标班级」下拉的数据源，并默认选中第一个班级。
+ * @returns 无返回值，结果写入响应式变量 classes / selectedClassId
+ */
 async function loadClasses() {
   if (!userStore.schoolId) return
   try {
-    const { data, error } = await supabase
+    const { data: classData, error } = await supabase
       .from('classes')
       .select('id, name')
       .eq('school_id', userStore.schoolId)
       .order('name', { ascending: true })
     if (error) throw error
-    classes.value = (data ?? []) as ClassOpt[]
+    classes.value = (classData ?? []) as ClassOpt[]
     if (classes.value.length > 0 && !selectedClassId.value) {
       selectedClassId.value = classes.value[0].id
     }
-  } catch (err: any) {
-    ElMessage.error(err.message || '加载班级列表失败')
+  } catch (err: unknown) {
+    ElMessage.error(err instanceof Error && err.message ? err.message : '加载班级列表失败')
   }
 }
 
+/**
+ * 下载学生导入 Excel 模板（A 列序号、B 列姓名、C 列学号、D 列备注）。
+ * @returns 无返回值，直接触发浏览器下载
+ */
 function downloadTemplate() {
   const wb = XLSX.utils.book_new()
-  const data = [
+  const templateRows = [
     ['序号', '学生姓名', '学号', '备注'],
     ['1', '张三', '2024001', ''],
     ['2', '李四', '2024002', ''],
   ]
-  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(data), '学生名单')
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(templateRows), '学生名单')
   XLSX.writeFile(wb, '学生导入模板.xlsx')
 }
 
+/**
+ * 上传前钩子：校验文件后缀并解析 Excel，把 B 列姓名、C 列学号写入预览列表。
+ * 首行为表头，从第二行开始读取；姓名为空的行直接跳过。
+ * @param file 用户选择的文件
+ * @returns 固定返回 false，阻止 el-upload 的自动上传（解析在前端完成）
+ */
 function beforeUpload(file: File) {
   const valid = file.name.endsWith('.xlsx') || file.name.endsWith('.xls')
   if (!valid) {
@@ -70,20 +84,20 @@ function beforeUpload(file: File) {
   importResult.value = null
   file
     .arrayBuffer()
-    .then((buf) => {
-      const wb = XLSX.read(buf, { type: 'array' })
+    .then((arrayBuffer) => {
+      const wb = XLSX.read(arrayBuffer, { type: 'array' })
       const sheet = wb.Sheets[wb.SheetNames[0]]
-      const rows: any[][] = XLSX.utils.sheet_to_json(sheet, { header: 1 })
-      const parsed: ParsedStudent[] = []
-      for (let i = 1; i < rows.length; i++) {
-        const r = rows[i]
-        if (!Array.isArray(r) || r.length === 0) continue
-        const name = String(r[1] ?? '').trim()
-        const student_no = String(r[2] ?? '').trim()
+      const sheetRows: any[][] = XLSX.utils.sheet_to_json(sheet, { header: 1 })
+      const parsedStudents: ParsedStudent[] = []
+      for (let rowIndex = 1; rowIndex < sheetRows.length; rowIndex++) {
+        const sheetRow = sheetRows[rowIndex]
+        if (!Array.isArray(sheetRow) || sheetRow.length === 0) continue
+        const name = String(sheetRow[1] ?? '').trim()
+        const student_no = String(sheetRow[2] ?? '').trim()
         if (!name) continue
-        parsed.push({ name, student_no })
+        parsedStudents.push({ name, student_no })
       }
-      parsedRows.value = parsed
+      parsedRows.value = parsedStudents
       ElMessage.success(`解析完成，共 ${parsedRows.value.length} 条记录`)
     })
     .catch((err) => {
@@ -92,6 +106,11 @@ function beforeUpload(file: File) {
   return false
 }
 
+/**
+ * 把预览数据批量写入 students 表。
+ * 学号唯一约束冲突（23505 / duplicate）时，回填「学号重复」明细而不抛出，其他错误交给 catch 统一提示。
+ * @returns 无返回值，结果写入响应式变量 importResult
+ */
 async function handleImport() {
   if (parsedRows.value.length === 0) {
     ElMessage.warning('请先上传并解析 Excel 文件')
@@ -104,22 +123,22 @@ async function handleImport() {
   uploading.value = true
   importResult.value = null
   try {
-    const payload = parsedRows.value.map((r) => ({
-      name: r.name,
-      student_no: r.student_no || null,
+    const payload = parsedRows.value.map((studentRow) => ({
+      name: studentRow.name,
+      student_no: studentRow.student_no || null,
       class_id: selectedClassId.value,
       school_id: userStore.schoolId,
     }))
-    const { data, error } = await supabase.from('students').insert(payload).select('student_no')
+    const { data: insertedRows, error } = await supabase.from('students').insert(payload).select('student_no')
     if (error) {
       if (error.code === '23505' || (error.details && String(error.details).includes('duplicate'))) {
         const existingNos = new Set(
-          (data as any[])?.map((d: any) => d.student_no).filter(Boolean) ?? [],
+          (insertedRows as any[])?.map((row: any) => row.student_no).filter(Boolean) ?? [],
         )
         const errors: ImportResult['errors'] = []
-        for (const r of parsedRows.value) {
-          if (r.student_no && existingNos.has(r.student_no)) {
-            errors.push({ name: r.name, student_no: r.student_no, reason: '学号重复' })
+        for (const studentRow of parsedRows.value) {
+          if (studentRow.student_no && existingNos.has(studentRow.student_no)) {
+            errors.push({ name: studentRow.name, student_no: studentRow.student_no, reason: '学号重复' })
           }
         }
         importResult.value = {
@@ -140,8 +159,8 @@ async function handleImport() {
       ElMessage.success(`成功导入 ${parsedRows.value.length} 条学生记录`)
       parsedRows.value = []
     }
-  } catch (err: any) {
-    ElMessage.error(err.message || '导入失败')
+  } catch (err: unknown) {
+    ElMessage.error(err instanceof Error && err.message ? err.message : '导入失败')
   } finally {
     uploading.value = false
   }
@@ -166,7 +185,7 @@ onMounted(loadClasses)
     <el-form label-width="100px" style="margin-bottom: 16px">
       <el-form-item label="目标班级">
         <el-select v-model="selectedClassId" placeholder="请选择班级" style="width: 280px">
-          <el-option v-for="c in classes" :key="c.id" :label="c.name" :value="c.id" />
+          <el-option v-for="classItem in classes" :key="classItem.id" :label="classItem.name" :value="classItem.id" />
         </el-select>
       </el-form-item>
       <el-form-item label="上传文件">
@@ -210,11 +229,11 @@ onMounted(loadClasses)
       >
         <ul v-if="importResult.errors.length" style="margin: 4px 0 0; padding-left: 18px">
           <li
-            v-for="(e, i) in importResult.errors.slice(0, 10)"
-            :key="i"
+            v-for="(importError, errorIndex) in importResult.errors.slice(0, 10)"
+            :key="errorIndex"
             style="font-size: 12px"
           >
-            {{ e.name }}（{{ e.student_no || '无学号' }}）：{{ e.reason }}
+            {{ importError.name }}（{{ importError.student_no || '无学号' }}）：{{ importError.reason }}
           </li>
           <li v-if="importResult.errors.length > 10" style="font-size: 12px">
             ... 还有 {{ importResult.errors.length - 10 }} 条未展示

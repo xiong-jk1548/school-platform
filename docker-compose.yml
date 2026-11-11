@@ -11,23 +11,24 @@
 # 停止：   docker compose -p school-platform down
 # 查看日志：docker compose -p school-platform logs -f web
 # 前端重建：docker compose -p school-platform up -d --build web
+#
+# 离线包与在线开发机的三处差异（踩过，勿改回去）：
+#   1. 所有 image 必须是 retag 后的标准名（postgres:15-alpine 这种）。
+#      带加速源前缀（docker.m.daocloud.io/...）在离线机上拉不到，compose 直接起不来。
+#   2. web 不能用 build，必须用离线镜像 school-platform-web:latest
+#      （镜像里已含 vite build 产物，离线机没有 node 基础镜像可用来构建）。
+#   3. 本文件读同目录的 .env，且 .env 必须是无 BOM 的 UTF-8——
+#      PowerShell 的 Out-File -Encoding utf8 和记事本都会写 BOM，
+#      首行变量名会带上 BOM 导致解析失败。
 # ============================================================
 
 services:
   # ---------------- 前端（Vue3 + Nginx） ----------------
+  # 离线部署：直接用打包好的离线镜像（已烧录 http://127.0.0.1:8000 的 API 地址与 anon key）
   web:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: school-platform-web:latest
     container_name: school-web
     restart: unless-stopped
-    # 前端默认用 mock 模式（数据在浏览器里），改走真后端需同时：
-    #   1) 浏览器 console: localStorage.setItem('USE_MOCK', 'false')
-    #   2) 前端 .env.production 设 VITE_USE_REAL_SUPABASE=true + URL + ANON_KEY
-    environment:
-      - VITE_SUPABASE_URL=http://supabase-kong:8000
-      - VITE_SUPABASE_ANON_KEY=${SUPABASE_ANON_KEY}
-      - VITE_USE_REAL_SUPABASE=false
     ports:
       - "8080:80"
     depends_on:
@@ -49,6 +50,7 @@ services:
     volumes:
       - supabase-db-data:/var/lib/postgresql/data
     ports:
+      # 只绑回环地址：数据库不暴露到局域网
       - "127.0.0.1:5432:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U supabase -d postgres"]
@@ -76,13 +78,22 @@ services:
 
   auth:
     container_name: supabase-auth
-    image: supabase/gotrue:v2.160.0
+    # 坑：gotrue v2.160 实际监听 8081（不是 8080），换版本前先
+    #     docker run -it ghcr.io/supabase/gotrue:<版本> serve 看启动日志，
+    #     再把 docker/kong.yml 里 auth 的 upstream 端口一起改掉，否则 Kong 502
+    image: ghcr.io/supabase/gotrue:v2.160.0
     restart: unless-stopped
     depends_on:
       db: { condition: service_healthy }
+    volumes:
+      - ./docker/init/gotrue-migrations:/usr/local/etc/auth/migrations:ro
     environment:
       GOTRUE_DB_DRIVER: postgres
-      GOTRUE_DATABASE_URL: postgres://supabase:${POSTGRES_PASSWORD}@db:5432/postgres?sslmode=disable
+      # 坑：search_path 必须带上 auth，否则 gotrue 找不到 auth.users
+      #     （报 relation "users" does not exist）；另外 POSTGRES_PASSWORD
+      #     不要含 ! # $ & 这类 URL 特殊字符，否则连接串会被截断导致 gotrue panic
+      DATABASE_URL: postgres://supabase:${POSTGRES_PASSWORD}@db:5432/postgres?sslmode=disable&search_path=auth,public
+      API_EXTERNAL_URL: ${SITE_URL}
       GOTRUE_SITE_URL: ${SITE_URL}
       GOTRUE_JWT_SECRET: ${JWT_SECRET}
       GOTRUE_JWT_EXP: 3600
@@ -92,6 +103,12 @@ services:
       GOTRUE_PASSWORD_MIN_LENGTH: 6
       GOTRUE_MAILER_AUTOCONFIRM: "true"
       GOTRUE_MAILER_EMAIL_CONFIRMATION_REQUIRED: "false"
+      GOTRUE_EXTERNAL_EMAIL_ENABLED: "true"
+      # 手机号登录：这两项缺一不可，且还要保证 auth.users.phone_confirmed_at 非空
+      # （种子账号由 docker/init/08_fix_seed_auth.sql 补），否则密码对也报 Phone not confirmed
+      GOTRUE_EXTERNAL_PHONE_ENABLED: "true"
+      GOTRUE_SMS_AUTOCONFIRM: "true"
+      GOTRUE_SMS_PHONE_CONFIRMATION_REQUIRED: "false"
       GOTRUE_SMTP_ADMIN_EMAIL: admin@example.com
       GOTRUE_SMTP_HOST: 127.0.0.1
       GOTRUE_SMTP_PORT: 25
@@ -104,7 +121,7 @@ services:
 
   kong:
     container_name: supabase-kong
-    image: kong:2.8.1
+    image: kong:2.8.1-alpine
     restart: unless-stopped
     depends_on: [rest, auth]
     environment:
@@ -116,6 +133,9 @@ services:
       KONG_ADMIN_ERROR_LOG: /dev/stderr
       KONG_ADMIN_LISTEN: "off"
     volumes:
+      # 坑：kong.yml 是挂载文件，不是环境变量——改完必须 docker restart supabase-kong
+      #     才生效；且文件里的全局 cors 插件不能丢，丢了会全部请求报
+      #     No 'Access-Control-Allow-Origin' header
       - ./docker/kong.yml:/tmp/kong.yml:ro
     # 局域网开放 8000 端口 —— 前端需要从这里访问 REST / Auth API
     ports:

@@ -1,5 +1,5 @@
 /* =====================================================
-   校园信息化服务平台 · 设计系统
+   智慧校园管理平台 · 设计系统
    科技蓝 × 校园风 —— 源自《校园数据平台-设计风格方案》
    ===================================================== */
 
@@ -252,13 +252,4 @@ a {
 .el-select__wrapper,
 .el-textarea__inner {
   border-radius: 10px !important;
-}
-
-/* 登录页渐变（深蓝 → 科技蓝） */
-.login-container {
-  min-height: 100vh;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  background: linear-gradient(135deg, #1E3A8A 0%, #2B5CE6 100%);
 }

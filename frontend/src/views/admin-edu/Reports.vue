@@ -36,36 +36,41 @@ const statCards: StatCard[] = [
   { title: '本月积分变动', value: 0, icon: TrendCharts, color: '#fa8c16' },
 ]
 
+/**
+ * 加载统计报表顶部的三张汇总卡片（学校总数、学生总数、本月积分变动），
+ * 随后继续加载各学校明细。
+ * @returns 无返回值，汇总写入 summary，明细写入 tableData
+ */
 async function loadData() {
   loading.value = true
   try {
     const [
-      { count: schoolCount, error: schErr },
-      { count: studentCount, error: stuErr },
+      { count: schoolTotal, error: schoolQueryError },
+      { count: studentTotal, error: studentQueryError },
     ] = await Promise.all([
       supabase.from('schools').select('*', { count: 'exact', head: true }),
       supabase.from('students').select('*', { count: 'exact', head: true }),
     ])
-    if (schErr) throw schErr
-    if (stuErr) throw stuErr
+    if (schoolQueryError) throw schoolQueryError
+    if (studentQueryError) throw studentQueryError
 
     const now = new Date()
     const monthStart = new Date(now.getFullYear(), now.getMonth(), 1).toISOString()
 
-    const { data: logs, error: logErr } = await supabase
+    const { data: scoreLogs, error: logQueryError } = await supabase
       .from('score_log')
       .select('score, created_at, students!inner(school_id)')
       .gte('created_at', monthStart)
-    if (logErr) throw logErr
+    if (logQueryError) throw logQueryError
 
-    const monthTotal = (logs ?? []).reduce(
-      (acc: number, l: any) => acc + (Number(l.score) || 0),
+    const monthTotal = (scoreLogs ?? []).reduce(
+      (acc: number, scoreLog: any) => acc + (Number(scoreLog.score) || 0),
       0,
     )
 
     summary.value = {
-      schoolCount: schoolCount ?? 0,
-      studentCount: studentCount ?? 0,
+      schoolCount: schoolTotal ?? 0,
+      studentCount: studentTotal ?? 0,
       monthTotal,
     }
 
@@ -77,51 +82,56 @@ async function loadData() {
   }
 }
 
+/**
+ * 按学校维度汇总积分明细：学生数、总积分，以及本月加分、减分与净变动。
+ * @param monthStart 本月起始时间（ISO 字符串），用于筛出本月积分流水
+ * @returns 无返回值，汇总结果写入 tableData
+ */
 async function loadSchoolStats(monthStart: string) {
-  const { data: schools, error: schErr } = await supabase
+  const { data: schoolList, error: schoolQueryError } = await supabase
     .from('schools')
     .select('id, name')
     .order('name')
-  if (schErr) throw schErr
+  if (schoolQueryError) throw schoolQueryError
 
-  const { data: students, error: stuErr } = await supabase
+  const { data: studentList, error: studentQueryError } = await supabase
     .from('students')
     .select('id, school_id, total_score')
-  if (stuErr) throw stuErr
+  if (studentQueryError) throw studentQueryError
 
-  const { data: logs, error: logErr } = await supabase
+  const { data: scoreLogs, error: logQueryError } = await supabase
     .from('score_log')
     .select('score, created_at, students!inner(school_id)')
-  if (logErr) throw logErr
+  if (logQueryError) throw logQueryError
 
-  const result: SchoolStatRow[] = []
+  const schoolStatList: SchoolStatRow[] = []
 
-  for (const s of schools ?? []) {
-    const sid = s.id
-    const schoolStudents = (students ?? []).filter(
-      (st: any) => st.school_id === sid,
+  for (const school of schoolList ?? []) {
+    const schoolId = school.id
+    const schoolStudents = (studentList ?? []).filter(
+      (student: any) => student.school_id === schoolId,
     )
     const studentCount = schoolStudents.length
     const totalScore = schoolStudents.reduce(
-      (acc: number, st: any) => acc + (Number(st.total_score) || 0),
+      (acc: number, student: any) => acc + (Number(student.total_score) || 0),
       0,
     )
 
-    const monthLogs = (logs ?? []).filter(
-      (l: any) =>
-        l.students?.school_id === sid &&
-        l.created_at >= monthStart,
+    const monthLogs = (scoreLogs ?? []).filter(
+      (scoreLog: any) =>
+        scoreLog.students?.school_id === schoolId &&
+        scoreLog.created_at >= monthStart,
     )
     const monthAdd = monthLogs
-      .filter((l: any) => Number(l.score) > 0)
-      .reduce((acc: number, l: any) => acc + Number(l.score), 0)
+      .filter((scoreLog: any) => Number(scoreLog.score) > 0)
+      .reduce((acc: number, scoreLog: any) => acc + Number(scoreLog.score), 0)
     const monthSub = monthLogs
-      .filter((l: any) => Number(l.score) < 0)
-      .reduce((acc: number, l: any) => acc + Math.abs(Number(l.score)), 0)
+      .filter((scoreLog: any) => Number(scoreLog.score) < 0)
+      .reduce((acc: number, scoreLog: any) => acc + Math.abs(Number(scoreLog.score)), 0)
 
-    result.push({
-      school_id: sid,
-      school_name: s.name,
+    schoolStatList.push({
+      school_id: schoolId,
+      school_name: school.name,
       student_count: studentCount,
       total_score: totalScore,
       month_change: monthAdd - monthSub,
@@ -130,17 +140,21 @@ async function loadSchoolStats(monthStart: string) {
     })
   }
 
-  tableData.value = result
+  tableData.value = schoolStatList
 }
 
+/**
+ * 把各学校统计明细整理成中文表头后导出为 Excel 文件。
+ * @returns 无返回值，导出成功后在页面给出提示
+ */
 function handleExport() {
-  const exportRows = tableData.value.map((row) => ({
-    学校名称: row.school_name,
-    学生数: row.student_count,
-    总积分: row.total_score,
-    本月加分: row.month_add,
-    本月减分: row.month_sub,
-    本月净变动: row.month_change,
+  const exportRows = tableData.value.map((schoolStat) => ({
+    学校名称: schoolStat.school_name,
+    学生数: schoolStat.student_count,
+    总积分: schoolStat.total_score,
+    本月加分: schoolStat.month_add,
+    本月减分: schoolStat.month_sub,
+    本月净变动: schoolStat.month_change,
   }))
   exportToExcel(exportRows, '全区积分统计')
   ElMessage.success('导出成功')
@@ -153,7 +167,7 @@ onMounted(loadData)
   <div class="page">
     <div class="stat-cards">
       <div
-        v-for="(card, idx) in statCards"
+        v-for="(card, cardIndex) in statCards"
         :key="card.title"
         class="stat-card"
         :style="{ borderTopColor: card.color }"
@@ -162,9 +176,9 @@ onMounted(loadData)
           <div class="stat-title">{{ card.title }}</div>
           <div class="stat-value">
             {{
-              idx === 0
+              cardIndex === 0
                 ? summary.schoolCount
-                : idx === 1
+                : cardIndex === 1
                   ? summary.studentCount
                   : summary.monthTotal
             }}
@@ -195,32 +209,32 @@ onMounted(loadData)
         <el-table-column prop="school_name" label="学校名称" min-width="180" />
         <el-table-column prop="student_count" label="学生数" width="100" align="center" />
         <el-table-column prop="total_score" label="总积分" width="120" align="right">
-          <template #default="{ row }">
-            <span class="score-total">{{ row.total_score }}</span>
+          <template #default="{ row: schoolStat }">
+            <span class="score-total">{{ schoolStat.total_score }}</span>
           </template>
         </el-table-column>
         <el-table-column label="本月加分" width="120" align="right">
-          <template #default="{ row }">
-            <span class="score-add">+{{ row.month_add }}</span>
+          <template #default="{ row: schoolStat }">
+            <span class="score-add">+{{ schoolStat.month_add }}</span>
           </template>
         </el-table-column>
         <el-table-column label="本月减分" width="120" align="right">
-          <template #default="{ row }">
-            <span class="score-sub">-{{ row.month_sub }}</span>
+          <template #default="{ row: schoolStat }">
+            <span class="score-sub">-{{ schoolStat.month_sub }}</span>
           </template>
         </el-table-column>
         <el-table-column label="本月净变动" width="130" align="right">
-          <template #default="{ row }">
+          <template #default="{ row: schoolStat }">
             <span
               :class="
-                row.month_change > 0
+                schoolStat.month_change > 0
                   ? 'score-add'
-                  : row.month_change < 0
+                  : schoolStat.month_change < 0
                     ? 'score-sub'
                     : ''
               "
             >
-              {{ row.month_change > 0 ? '+' : '' }}{{ row.month_change }}
+              {{ schoolStat.month_change > 0 ? '+' : '' }}{{ schoolStat.month_change }}
             </span>
           </template>
         </el-table-column>

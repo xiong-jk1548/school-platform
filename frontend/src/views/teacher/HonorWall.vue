@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, computed } from 'vue'
+import { ref, onMounted, computed, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { Medal } from '@element-plus/icons-vue'
 import { supabase } from '@/api/supabase'
@@ -26,48 +26,68 @@ const levelOptions = ['校级', '区级', '市级', '省级', '国家级', '其�
 
 const filteredAwards = computed(() => {
   if (!filterLevel.value) return awards.value
-  return awards.value.filter((a) => a.level === filterLevel.value)
+  return awards.value.filter((award) => award.level === filterLevel.value)
 })
 
 const groupedByLevel = computed(() => {
-  const groups: Record<string, AwardRow[]> = {}
-  filteredAwards.value.forEach((a) => {
-    const lvl = a.level || '其他'
-    if (!groups[lvl]) groups[lvl] = []
-    groups[lvl].push(a)
+  const groupsByLevel: Record<string, AwardRow[]> = {}
+  filteredAwards.value.forEach((award) => {
+    const awardLevel = award.level || '其他'
+    if (!groupsByLevel[awardLevel]) groupsByLevel[awardLevel] = []
+    groupsByLevel[awardLevel].push(award)
   })
-  return groups
+  return groupsByLevel
 })
 
+/**
+ * 加载本班获奖记录并按学生 id 批量补齐 student_name
+ * ⚠️ 必须显式按 class_id 收窄：`student_awards` 的教师读取策略是**按学校**放行的
+ *（09 脚本给 teacher 的是 school_id 粒度，与 student_scores 的 class_id 粒度不同），
+ * 漏掉过滤就会把全校获奖记录倒进本页 —— 即 DEPLOY-LESSONS 第 19 条「荣誉墙数据串了」。
+ * 该条当时只补了注释、查询没真正加过滤，故本次重犯；同款问题在 AwardRegister.vue 一并修掉。
+ * @returns 无返回值（副作用：写入 awards，并在 finally 中复位 loading）
+ */
 async function loadAwards() {
   if (!userStore.classId) return
   loading.value = true
   try {
-    const { data, error } = await supabase
+    const { data: awardRows, error } = await supabase
       .from('student_awards')
       .select('*')
+      .eq('class_id', userStore.classId)
       .order('award_date', { ascending: false })
     if (error) throw error
 
-    const rows = (data ?? []) as AwardRow[]
+    const awardRecords = (awardRows ?? []) as AwardRow[]
     // 补齐 student_name（mock 里已有，真实后端可能没有）
-    const studentIds = Array.from(new Set(rows.map((r) => r.student_id)))
+    const studentIds = Array.from(new Set(awardRecords.map((award) => award.student_id)))
     if (studentIds.length > 0) {
-      const { data: stuRes } = await supabase
+      const { data: studentRows } = await supabase
         .from('students')
         .select('id, student_name')
         .in('id', studentIds)
       const stuMap: Record<string, string> = {}
-      ;((stuRes ?? []) as any[]).forEach((s) => { stuMap[s.id] = s.student_name })
-      rows.forEach((r) => { if (!r.student_name) r.student_name = stuMap[r.student_id] })
+      ;((studentRows ?? []) as any[]).forEach((student) => { stuMap[student.id] = student.student_name })
+      awardRecords.forEach((award) => { if (!award.student_name) award.student_name = stuMap[award.student_id] })
     }
-    awards.value = rows
-  } catch (err: any) {
-    ElMessage.error(err.message || '加载荣誉墙失败')
+    awards.value = awardRecords
+  } catch (err: unknown) {
+    ElMessage.error(err instanceof Error && err.message ? err.message : '加载荣誉墙失败')
   } finally {
     loading.value = false
   }
 }
+
+/**
+ * 顶栏班级下拉切换后跟随重载，避免标题显示新班级、卡片仍是旧班级的获奖记录。
+ * @param classId 当前选中班级 id
+ * @returns 无返回值
+ */
+watch(() => userStore.classId, async (classId, previousClassId) => {
+  if (classId === previousClassId) return
+  awards.value = []
+  await loadAwards()
+})
 
 onMounted(loadAwards)
 </script>
@@ -90,12 +110,12 @@ onMounted(loadAwards)
       暂无荣誉记录，前往「获奖登记」添加吧 ✨
     </div>
 
-    <div v-for="(list, level) in groupedByLevel" :key="level" class="award-group">
+    <div v-for="(levelAwards, level) in groupedByLevel" :key="level" class="award-group">
       <div class="group-title">{{ level }}</div>
       <el-row :gutter="16">
         <el-col
-          v-for="item in list"
-          :key="item.id"
+          v-for="award in levelAwards"
+          :key="award.id"
           :xs="24"
           :sm="12"
           :md="8"
@@ -103,13 +123,13 @@ onMounted(loadAwards)
           class="award-col"
         >
           <div class="award-card">
-            <div class="award-title">{{ item.title }}</div>
+            <div class="award-title">{{ award.title }}</div>
             <div class="award-meta">
-              <el-tag type="primary" effect="plain" size="small">{{ item.level }}</el-tag>
-              <span class="award-date">{{ new Date(item.award_date).toLocaleDateString('zh-CN') }}</span>
+              <el-tag type="primary" effect="plain" size="small">{{ award.level }}</el-tag>
+              <span class="award-date">{{ new Date(award.award_date).toLocaleDateString('zh-CN') }}</span>
             </div>
-            <div class="award-student">获奖者：{{ item.student_name || '-' }}</div>
-            <div v-if="item.description" class="award-desc">{{ item.description }}</div>
+            <div class="award-student">获奖者：{{ award.student_name || '-' }}</div>
+            <div v-if="award.description" class="award-desc">{{ award.description }}</div>
           </div>
         </el-col>
       </el-row>

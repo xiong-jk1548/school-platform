@@ -4,6 +4,12 @@
 --   A. Supabase Dashboard SQL 编辑器（http://服务器IP:8000）
 --   B. docker exec -i supabase-db psql -U supabase -d postgres < 01_schema.sql
 -- 前置条件：docker compose up -d 后，auth 容器已初始化 auth.users
+--
+-- 说明：本文件是全部业务表的**唯一权威定义**。
+--       homework_subjects / homework_records / borrow_items / borrow_records
+--       这四张表历史上在 02_features_v2.sql 里被重复定义过一次（且列名不同），
+--       因两处都用 CREATE TABLE IF NOT EXISTS，实际生效的一直是本文件这一版。
+--       现已在 02_features_v2.sql 中删掉重复定义，避免"两套列"再次出现。
 -- ============================================================
 
 -- 清空旧版（仅第一次部署时，已部署过就别跑）
@@ -139,7 +145,12 @@ CREATE TABLE IF NOT EXISTS public.borrow_items (
     school_id UUID NOT NULL REFERENCES public.schools(id) ON DELETE CASCADE,
     class_id UUID REFERENCES public.classes(id) ON DELETE SET NULL,
     create_time TIMESTAMPTZ NOT NULL DEFAULT now(),
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    location TEXT,                                          -- 存放位置（物品台账可填，可为空）
+    -- 可用数量不允许为负（借出时由触发器带 available_quantity >= qty 守卫）
+    -- 注：不加「available_quantity <= total_quantity」——物品尚有借出时若把总数调小，
+    --     前端按差额同步会把可用数量截断到 0，随后归还回补就可能超过总数而误报约束冲突。
+    CONSTRAINT borrow_items_available_qty_check CHECK (available_quantity >= 0)
 );
 
 -- 10. 借阅记录表
@@ -151,12 +162,15 @@ CREATE TABLE IF NOT EXISTS public.borrow_records (
     status TEXT NOT NULL CHECK (status IN ('borrowed','returned','overdue')) DEFAULT 'borrowed',
     borrow_date DATE NOT NULL DEFAULT CURRENT_DATE,
     actual_return_date DATE,
-    expect_return_date DATE,
+    expected_return_date DATE,
     remark TEXT,
     school_id UUID NOT NULL REFERENCES public.schools(id) ON DELETE CASCADE,
     class_id UUID REFERENCES public.classes(id) ON DELETE SET NULL,
     create_time TIMESTAMPTZ NOT NULL DEFAULT now(),
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    qty INT NOT NULL DEFAULT 1,                             -- 本次借出数量（可一次借出多件）
+    return_time TIMESTAMPTZ,                                -- 归还时刻（精确到分钟，actual_return_date 只到日）
+    operator_user_id UUID REFERENCES auth.users(id)         -- 经办教师
 );
 
 -- 11. 学生获奖表
@@ -194,6 +208,20 @@ CREATE TABLE IF NOT EXISTS public.student_scores (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- 13. 成绩访问授权表
+--     成绩（student_scores）默认只有本班班主任可读写；班主任可在此表登记"额外允许访问本班成绩"的老师。
+--     粒度：一个班主任对一个班一条，可授予本校任意教师；只跨班不跨校（school_id 必须与被授权人一致）。
+CREATE TABLE IF NOT EXISTS public.grade_access_grants (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    school_id UUID NOT NULL REFERENCES public.schools(id) ON DELETE CASCADE,
+    class_id UUID NOT NULL REFERENCES public.classes(id) ON DELETE CASCADE,
+    teacher_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+    granted_by UUID REFERENCES auth.users(id) ON DELETE SET NULL,
+    create_time TIMESTAMPTZ NOT NULL DEFAULT now(),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT grade_access_grants_class_teacher_key UNIQUE (class_id, teacher_id)
+);
+
 -- ---------------------- 索引 ----------------------
 CREATE INDEX IF NOT EXISTS idx_profiles_school ON public.profiles(school_id);
 CREATE INDEX IF NOT EXISTS idx_profiles_class ON public.profiles(class_id);
@@ -209,6 +237,9 @@ CREATE INDEX IF NOT EXISTS idx_hw_notes_class_date ON public.homework_notes(clas
 CREATE INDEX IF NOT EXISTS idx_borrow_records_item ON public.borrow_records(item_id);
 CREATE INDEX IF NOT EXISTS idx_awards_student ON public.student_awards(student_id);
 CREATE INDEX IF NOT EXISTS idx_scores_student ON public.student_scores(student_id);
+CREATE INDEX IF NOT EXISTS idx_gag_class ON public.grade_access_grants(class_id);
+CREATE INDEX IF NOT EXISTS idx_gag_teacher ON public.grade_access_grants(teacher_id);
+CREATE INDEX IF NOT EXISTS idx_gag_school ON public.grade_access_grants(school_id);
 
 -- ---------------------- 开启 RLS ----------------------
 ALTER TABLE public.schools          ENABLE ROW LEVEL SECURITY;
@@ -223,6 +254,7 @@ ALTER TABLE public.borrow_items     ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.borrow_records   ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.student_awards   ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.student_scores   ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.grade_access_grants ENABLE ROW LEVEL SECURITY;
 
 -- ---------------------- 积分变更 RPC（原子操作） ----------------------
 CREATE OR REPLACE FUNCTION public.fn_change_student_score(

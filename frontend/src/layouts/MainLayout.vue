@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, watch, onMounted, onUnmounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { ElMessageBox } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { useUserStore } from '@/stores/user'
 import { navMenus, type TeacherView } from '@/router/menus'
 import { getSwitchableRoles, switchRole } from '@/utils/role-switch'
@@ -19,86 +19,164 @@ const userStore = useUserStore()
 const route = useRoute()
 const router = useRouter()
 
-const sidebarWidth = '220px'
+const navSidebarWidth = '220px'
 
-// 响应式：移动端用抽屉
-const isMobile = ref(false)
-const drawerVisible = ref(false)
-function checkMobile() {
-  isMobile.value = window.innerWidth < 768
+/** 响应式布局标记：视口宽度小于 768px 时侧边导航改由抽屉承载 */
+const isMobileViewport = ref(false)
+const mobileNavVisible = ref(false)
+
+/**
+ * 按当前视口宽度刷新移动端标记（<768px 判定为移动端，侧边栏改抽屉）。
+ * @returns 无
+ */
+function syncMobileViewport() {
+  isMobileViewport.value = window.innerWidth < 768
 }
 onMounted(() => {
-  checkMobile()
-  window.addEventListener('resize', checkMobile)
+  syncMobileViewport()
+  window.addEventListener('resize', syncMobileViewport)
 })
-onUnmounted(() => window.removeEventListener('resize', checkMobile))
+onUnmounted(() => window.removeEventListener('resize', syncMobileViewport))
 
-const TEACHER_VIEW_KEY = 'MOCK_TEACHER_VIEW'
-const teacherView = ref<TeacherView>(localStorage.getItem(TEACHER_VIEW_KEY) as TeacherView || 'frontend')
+const TEACHER_VIEW_STORAGE_KEY = 'MOCK_TEACHER_VIEW'
+const teacherViewMode = ref<TeacherView>(localStorage.getItem(TEACHER_VIEW_STORAGE_KEY) as TeacherView || 'frontend')
 
-watch(teacherView, (v) => {
-  localStorage.setItem(TEACHER_VIEW_KEY, v)
+/** 教师视图模式变化即落盘，刷新后仍停留在上次选择的前端/后台 */
+watch(teacherViewMode, (nextViewMode) => {
+  localStorage.setItem(TEACHER_VIEW_STORAGE_KEY, nextViewMode)
 })
 
-// 学校里所有班级 — 给教师下拉选择
-const schoolClasses = ref<{ id: string; class_name: string; grade?: string; homeroom_teacher_id?: string | null }[]>([])
-async function loadSchoolClasses() {
+/** 本学校全部班级记录，作为顶栏班级下拉的候选项 */
+const schoolClassOptions = ref<{ id: string; class_name: string; grade?: string; homeroom_teacher_id?: string | null }[]>([])
+
+/**
+ * 拉取本学校全部班级，供顶栏班级下拉使用。
+ * @returns Promise<void>，未绑定学校时直接返回
+ *
+ * 坑：schoolId 为 null 时必须提前 return —— 拿空值去过滤既筛不出数据，
+ * 下拉也会变成空白（"年级下拉空"那次就是这么漏的兜底）。
+ */
+async function fetchSchoolClasses() {
   if (!userStore.schoolId) return
   try {
-    const { data } = await supabase
+    const { data: classRecords } = await supabase
       .from('classes')
       .select('id, class_name, grade, homeroom_teacher_id')
       .eq('school_id', userStore.schoolId)
-    schoolClasses.value = (data ?? []) as any
+    schoolClassOptions.value = (classRecords ?? []) as any
   } catch { /* ignore */ }
 }
 
-watch(() => userStore.role, loadSchoolClasses)
-watch(() => userStore.schoolId, loadSchoolClasses)
-onMounted(loadSchoolClasses)
+watch(() => userStore.role, fetchSchoolClasses)
+watch(() => userStore.schoolId, fetchSchoolClasses)
+onMounted(fetchSchoolClasses)
 
-async function onClassChange(classId: string) {
-  const cls = schoolClasses.value.find((c) => c.id === classId)
-  if (!cls) return
-  userStore.setSelectedClass(cls.id, cls.class_name)
-  // 如果正在看后端但切到的不是自己的班，自动切回前端
-  if (teacherView.value === 'backend' && !userStore.isHomeroomForSelected) {
-    teacherView.value = 'frontend'
+/**
+ * 班级列表就绪后兜底选中班级：教师身份下若从没选过班，默认取第一个；
+ * 已选但该班已不在列表里（例如管理员切到教师身份后），同样重置为第一个。
+ * @param classOptions 最新的班级列表
+ * @returns 无
+ */
+/**
+ * 兜底班级：优先取教师档案里绑定的班级，取不到才退回列表第一条。
+ * ⚠️ 必须与后端 RLS 的 class_id 基准（JWT 里的 user_metadata.class_id）一致：
+ * 随手取 classOptions[0] 会选中同校的另一个班，导致按班级隔离的数据（物品借阅、
+ * 作业登记等）读取为空、写入被 RLS 拒绝。
+ * @param classOptions 本学校班级列表
+ * @returns 兜底选中的班级记录；列表为空时返回 undefined
+ */
+function resolveFallbackClass(
+  classOptions: { id: string; class_name: string; grade?: string; homeroom_teacher_id?: string | null }[],
+) {
+  const boundClass = userStore.boundClassId
+    ? classOptions.find((classItem) => classItem.id === userStore.boundClassId)
+    : undefined
+  return boundClass ?? classOptions[0]
+}
+
+/**
+ * 班级列表就绪后兜底选中班级：教师身份下若从没选过班，默认取自己绑定的班；
+ * 已选但该班已不在列表里（例如管理员切到教师身份后），同样按上面的规则重置。
+ * @param classOptions 最新的班级列表
+ * @returns 无
+ */
+watch(schoolClassOptions, (classOptions) => {
+  if (!classOptions || classOptions.length === 0) return
+  if (userStore.role !== 'teacher') return
+  if (userStore.selectedClassId) {
+    // 已选但 selectedClassId 不在下拉里（例如管理员切到 teacher 后），就重置
+    if (!classOptions.find((classItem) => classItem.id === userStore.selectedClassId)) {
+      const fallbackClass = resolveFallbackClass(classOptions)
+      if (fallbackClass) userStore.setSelectedClass(fallbackClass.id, fallbackClass.class_name)
+    }
+    return
+  }
+  const fallbackClass = resolveFallbackClass(classOptions)
+  if (fallbackClass) userStore.setSelectedClass(fallbackClass.id, fallbackClass.class_name)
+})
+
+/**
+ * 顶栏班级下拉变更时把选中班级写进 store。
+ * @param selectedClassId 选中的 classes.id
+ * @returns Promise<void>
+ */
+async function handleClassSelect(selectedClassId: string) {
+  const matchedClass = schoolClassOptions.value.find((classItem) => classItem.id === selectedClassId)
+  if (!matchedClass) return
+  userStore.setSelectedClass(matchedClass.id, matchedClass.class_name)
+  // 如果没有选班，自动切回前端
+  if (!userStore.selectedClassId) {
+    teacherViewMode.value = 'frontend'
   }
 }
 
-const displayMenus = computed(() => {
-  return navMenus.filter((item) => {
-    if (!userStore.role || !item.roles.includes(userStore.role)) return false
+/**
+ * 侧边栏最终可见的菜单：按"角色 → 教师视图模式 → 是否已选班级"三级过滤。
+ * 后台类菜单只要求已选班级，是否真的能读写由后端 RLS 按 class_id / school_id 决定。
+ * @returns 当前角色与视图模式下应当展示的菜单项数组
+ */
+const visibleMenus = computed(() => {
+  return navMenus.filter((menu) => {
+    if (!userStore.role || !menu.roles.includes(userStore.role)) return false
     if (userStore.role === 'teacher') {
-      if (item.teacherView && !item.teacherView.includes(teacherView.value)) return false
-      // 后端菜单仅班主任在自己的班里可见
-      if (teacherView.value === 'backend' && (item.teacherView?.includes('backend'))) {
-        if (!userStore.isHomeroomForSelected) return false
+      if (menu.teacherView && !menu.teacherView.includes(teacherViewMode.value)) return false
+      // 后端菜单：只要当前已选了一个班(active teacher 就行；
+      // 真正能不能读写，由后端 RLS 按 class_id / school_id 限制)
+      if (teacherViewMode.value === 'backend' && menu.teacherView?.includes('backend')) {
+        if (!userStore.selectedClassId) return false
       }
     }
     return true
   })
 })
 
-const switchableRoles = computed(() => getSwitchableRoles())
-const currentRoleLabel = computed(() => {
-  const map = { sys_admin: '教育局管理员', school_admin: '学校管理员', teacher: '教师' }
-  return map[userStore.role as keyof typeof map] ?? ''
+const roleSwitchOptions = computed(() => getSwitchableRoles())
+
+const activeRoleLabel = computed(() => {
+  const roleDisplayNames = { sys_admin: '教育局管理员', school_admin: '学校管理员', teacher: '教师' }
+  return roleDisplayNames[userStore.role as keyof typeof roleDisplayNames] ?? ''
 })
 
-const isTeacher = computed(() => userStore.role === 'teacher')
-const viewLabel = computed(() => (teacherView.value === 'frontend' ? '班级前端' : '班级后台'))
+const isTeacherRole = computed(() => userStore.role === 'teacher')
+const teacherViewLabel = computed(() => (teacherViewMode.value === 'frontend' ? '班级前端' : '班级后台'))
 
-function toggleTeacherView() {
-  teacherView.value = teacherView.value === 'frontend' ? 'backend' : 'frontend'
+/**
+ * 在前端/后台两种教师视图之间切换，并跳到该视图的第一个菜单。
+ * @returns 无
+ */
+function switchTeacherView() {
+  teacherViewMode.value = teacherViewMode.value === 'frontend' ? 'backend' : 'frontend'
   // 切换后跳转到对应视图的第一个菜单
-  const firstMenu = displayMenus.value[0]
+  const firstMenu = visibleMenus.value[0]
   if (firstMenu && route.path !== firstMenu.path) {
     router.push(firstMenu.path)
   }
 }
 
+/**
+ * 二次确认后退出登录并回到登录页。
+ * @returns Promise<void>，用户在确认框点"取消"时静默返回
+ */
 async function handleLogout() {
   try {
     await ElMessageBox.confirm('确定要退出登录吗？', '提示', {
@@ -113,24 +191,102 @@ async function handleLogout() {
   }
 }
 
-function handleCommand(cmd: string) {
-  if (cmd === 'logout') {
+/**
+ * 用户下拉菜单的命令分发。
+ * @param command 下拉项绑定的命令名：'logout' 退出登录 / 'change-password' 打开改密弹窗
+ * @returns 无
+ */
+function handleAccountCommand(command: string) {
+  if (command === 'logout') {
     handleLogout()
+  } else if (command === 'change-password') {
+    passwordDialogVisible.value = true
   }
 }
 
-function onSwitchRole(role: 'sys_admin' | 'school_admin' | 'teacher') {
+// ============ 修改密码 ============
+const passwordDialogVisible = ref(false)
+const passwordSubmitting = ref(false)
+const passwordFormRef = ref()
+const passwordForm = ref({ oldPassword: '', newPassword: '', confirmPassword: '' })
+
+/** 改密表单校验规则：新密码至少 6 位；确认密码需与 newPassword 一致（跨字段校验） */
+const passwordRules = {
+  oldPassword: [{ required: true, message: '请输入当前密码', trigger: 'blur' }],
+  newPassword: [
+    { required: true, message: '请输入新密码', trigger: 'blur' },
+    { min: 6, message: '新密码至少 6 位', trigger: 'blur' },
+  ],
+  confirmPassword: [
+    { required: true, message: '请再次输入新密码', trigger: 'blur' },
+    {
+      validator: (_rule: any, value: string, callback: any) => {
+        if (value !== passwordForm.value.newPassword) callback(new Error('两次输入的密码不一致'))
+        else callback()
+      },
+      trigger: 'blur',
+    },
+  ],
+}
+
+/**
+ * 提交修改密码：先拿当前账号+原密码重新登录一次来验旧密码，验过再调 updateUser。
+ * @returns Promise<void>，表单校验失败或旧密码错误时提前返回
+ *
+ * 注意：这里必须显式抛 Error 才能让下面的 catch 统一提示，
+ * 所以第二个 try 内部不用区分 Supabase 的 error 对象形态。
+ */
+async function submitPasswordChange() {
+  try {
+    await passwordFormRef.value?.validate()
+  } catch {
+    return
+  }
+  passwordSubmitting.value = true
+  try {
+    // 先验证当前密码是否正确（用当前账号重新登录一次）
+    const accountIdentifier = userStore.email || userStore.phone || ''
+    if (!accountIdentifier) throw new Error('无法确定当前账号，请重新登录')
+    const { error: signInError } = await supabase.auth.signInWithPassword({
+      email: accountIdentifier.includes('@') ? accountIdentifier : undefined as any,
+      phone: accountIdentifier.includes('@') ? undefined as any : accountIdentifier,
+      password: passwordForm.value.oldPassword,
+    })
+    if (signInError) throw new Error('当前密码不正确')
+
+    // 修改密码
+    const { error } = await supabase.auth.updateUser({
+      password: passwordForm.value.newPassword,
+    })
+    if (error) throw error
+
+    ElMessage.success('密码修改成功，下次登录请使用新密码')
+    passwordDialogVisible.value = false
+    passwordForm.value = { oldPassword: '', newPassword: '', confirmPassword: '' }
+  } catch (err: unknown) {
+    ElMessage.error(err instanceof Error && err.message ? err.message : '密码修改失败')
+  } finally {
+    passwordSubmitting.value = false
+  }
+}
+
+/**
+ * 切换身份入口（下拉选中后由 role-switch 落盘并整页重载）。
+ * @param {'sys_admin' | 'school_admin' | 'teacher'} role 目标角色
+ * @returns 无
+ */
+function handleRoleSwitch(role: 'sys_admin' | 'school_admin' | 'teacher') {
   switchRole(role)
 }
 </script>
 
 <template>
-  <el-container class="main-layout">
+  <el-container class="platform-shell">
     <!-- 桌面端侧边栏 -->
-    <el-aside v-if="!isMobile" :width="sidebarWidth" class="sidebar">
-      <div class="logo-area">
-        <span class="logo-icon">🎓</span>
-        <span class="logo-text">校园信息化</span>
+    <el-aside v-if="!isMobileViewport" :width="navSidebarWidth" class="nav-sidebar">
+      <div class="brand-banner">
+        <span class="brand-emblem">🎓</span>
+        <span class="brand-name">智慧校园</span>
       </div>
       <el-menu
         :default-active="route.path"
@@ -138,9 +294,9 @@ function onSwitchRole(role: 'sys_admin' | 'school_admin' | 'teacher') {
         background-color="#001529"
         text-color="#c8d6e5"
         active-text-color="#1E6FD9"
-        class="nav-menu"
+        class="role-nav-menu"
       >
-        <template v-for="menu in displayMenus" :key="menu.path">
+        <template v-for="menu in visibleMenus" :key="menu.path">
           <el-menu-item :index="menu.path">
             <el-icon v-if="menu.icon"><component :is="menu.icon" /></el-icon>
             <span>{{ menu.title }}</span>
@@ -151,18 +307,18 @@ function onSwitchRole(role: 'sys_admin' | 'school_admin' | 'teacher') {
 
     <!-- 移动端抽屉 -->
     <el-drawer
-      v-if="isMobile"
-      v-model="drawerVisible"
+      v-if="isMobileViewport"
+      v-model="mobileNavVisible"
       direction="ltr"
       :size="260"
       :show-close="false"
       :with-header="false"
-      class="mobile-drawer"
+      class="mobile-nav-drawer"
     >
-      <div class="sidebar sidebar-drawer">
-        <div class="logo-area">
-          <span class="logo-icon">🎓</span>
-          <span class="logo-text">校园信息化</span>
+      <div class="nav-sidebar nav-sidebar-drawer">
+        <div class="brand-banner">
+          <span class="brand-emblem">🎓</span>
+          <span class="brand-name">智慧校园</span>
         </div>
         <el-menu
           :default-active="route.path"
@@ -170,10 +326,10 @@ function onSwitchRole(role: 'sys_admin' | 'school_admin' | 'teacher') {
           background-color="#001529"
           text-color="#c8d6e5"
           active-text-color="#1E6FD9"
-          class="nav-menu"
-          @select="drawerVisible = false"
+          class="role-nav-menu"
+          @select="mobileNavVisible = false"
         >
-          <template v-for="menu in displayMenus" :key="menu.path">
+          <template v-for="menu in visibleMenus" :key="menu.path">
             <el-menu-item :index="menu.path">
               <el-icon v-if="menu.icon"><component :is="menu.icon" /></el-icon>
               <span>{{ menu.title }}</span>
@@ -184,9 +340,9 @@ function onSwitchRole(role: 'sys_admin' | 'school_admin' | 'teacher') {
     </el-drawer>
 
     <el-container>
-      <el-header class="header">
-        <div class="header-left">
-          <el-icon v-if="isMobile" class="mobile-menu-btn" @click="drawerVisible = true">
+      <el-header class="top-bar">
+        <div class="top-bar-left">
+          <el-icon v-if="isMobileViewport" class="mobile-nav-toggle" @click="mobileNavVisible = true">
             <svg viewBox="0 0 1024 1024" width="20" height="20"><path fill="currentColor" d="M128 192h768v64H128zm0 320h768v64H128zm0 320h768v64H128z"/></svg>
           </el-icon>
           <el-breadcrumb separator="/">
@@ -194,25 +350,26 @@ function onSwitchRole(role: 'sys_admin' | 'school_admin' | 'teacher') {
               {{ route.meta.title ?? '首页' }}
             </el-breadcrumb-item>
           </el-breadcrumb>
-          <div class="school-info" v-if="userStore.role === 'school_admin'">
+          <div class="school-identity" v-if="userStore.role === 'school_admin'">
             <el-icon><School /></el-icon>
-            <span>{{ userStore.schoolId ?? '未关联学校' }}</span>
+            <!-- 兜底：学校名 → school_id → 未关联学校（曾把 school_id 当校名显示出一串 UUID） -->
+            <span>{{ userStore.schoolName ?? userStore.schoolId ?? '未关联学校' }}</span>
           </div>
           <!-- 教师：班级下拉选择器 -->
-          <div class="class-select-wrap" v-if="userStore.role === 'teacher'">
+          <div class="class-picker" v-if="userStore.role === 'teacher'">
             <el-icon style="color:#2B5CE6"><Reading /></el-icon>
             <el-select
               :model-value="userStore.selectedClassId"
               placeholder="选择班级"
               size="small"
               style="width: 160px"
-              @change="onClassChange"
+              @change="handleClassSelect"
             >
               <el-option
-                v-for="c in schoolClasses"
-                :key="c.id"
-                :label="`${c.class_name}${c.grade ? ' · ' + c.grade : ''}${userStore.boundClassId === c.id ? ' (班主任)' : ''}`"
-                :value="c.id"
+                v-for="classOption in schoolClassOptions"
+                :key="classOption.id"
+                :label="`${classOption.class_name}${classOption.grade ? ' · ' + classOption.grade : ''}${userStore.boundClassId === classOption.id ? ' (班主任)' : ''}`"
+                :value="classOption.id"
               />
             </el-select>
             <el-tag
@@ -225,46 +382,46 @@ function onSwitchRole(role: 'sys_admin' | 'school_admin' | 'teacher') {
           </div>
         </div>
 
-        <div class="header-right">
-          <div v-if="isTeacher && userStore.isHomeroomForSelected" class="view-switch" @click="toggleTeacherView">
-            <el-tag :type="teacherView === 'frontend' ? 'success' : 'primary'" effect="light">
-              {{ viewLabel }}
+        <div class="top-bar-right">
+          <div v-if="isTeacherRole && userStore.isHomeroomForSelected" class="teacher-view-toggle" @click="switchTeacherView">
+            <el-tag :type="teacherViewMode === 'frontend' ? 'success' : 'primary'" effect="light">
+              {{ teacherViewLabel }}
             </el-tag>
-            <span class="view-switch-hint">点击切换</span>
+            <span class="teacher-view-hint">点击切换</span>
           </div>
-          <el-dropdown trigger="click" @command="handleCommand">
-            <div class="user-dropdown-trigger">
+          <el-dropdown trigger="click" @command="handleAccountCommand">
+            <div class="account-menu-trigger">
               <el-avatar :size="32" :style="{ background: '#1E6FD9' }">
                 {{ (userStore.name ?? 'U').charAt(0).toUpperCase() }}
               </el-avatar>
-              <span class="user-name">{{ userStore.name ?? userStore.email }}</span>
+              <span class="account-name">{{ userStore.name ?? userStore.email }}</span>
               <el-icon><ArrowDown /></el-icon>
             </div>
             <template #dropdown>
               <el-dropdown-menu>
                 <el-dropdown-item disabled>
-                  角色：{{ currentRoleLabel }}
+                  角色：{{ activeRoleLabel }}
                 </el-dropdown-item>
-                <el-dropdown-item :command="'change-password'" disabled>
+                <el-dropdown-item :command="'change-password'">
                   <el-icon><Lock /></el-icon>
                   修改密码
                 </el-dropdown-item>
-                <el-dropdown-item divided v-if="switchableRoles.length > 1">
+                <el-dropdown-item divided v-if="roleSwitchOptions.length > 1">
                   <el-dropdown trigger="hover" placement="right-start">
-                    <div class="role-switch-trigger">
+                    <div class="role-switch-entry">
                       <el-icon><Refresh /></el-icon>
                       切换角色
                     </div>
                     <template #dropdown>
                       <el-dropdown-menu>
                         <el-dropdown-item
-                          v-for="opt in switchableRoles"
-                          :key="opt.role"
-                          :disabled="opt.role === userStore.role"
-                          @click="onSwitchRole(opt.role)"
+                          v-for="roleOption in roleSwitchOptions"
+                          :key="roleOption.role"
+                          :disabled="roleOption.role === userStore.role"
+                          @click="handleRoleSwitch(roleOption.role)"
                         >
-                          {{ opt.label }}
-                          <span v-if="opt.role === userStore.role" class="role-current-tag">
+                          {{ roleOption.label }}
+                          <span v-if="roleOption.role === userStore.role" class="role-current-hint">
                             (当前)
                           </span>
                         </el-dropdown-item>
@@ -282,27 +439,69 @@ function onSwitchRole(role: 'sys_admin' | 'school_admin' | 'teacher') {
         </div>
       </el-header>
 
-      <el-main class="main-content">
+      <el-main class="page-viewport">
         <router-view />
       </el-main>
     </el-container>
+
+    <!-- 修改密码对话框 -->
+    <el-dialog
+      v-model="passwordDialogVisible"
+      title="修改密码"
+      width="420px"
+      :close-on-click-modal="false"
+      destroy-on-close
+    >
+      <el-form ref="passwordFormRef" :model="passwordForm" :rules="passwordRules" label-width="90px">
+        <el-form-item label="当前密码" prop="oldPassword">
+          <el-input
+            v-model="passwordForm.oldPassword"
+            type="password"
+            show-password
+            placeholder="请输入当前密码"
+          />
+        </el-form-item>
+        <el-form-item label="新密码" prop="newPassword">
+          <el-input
+            v-model="passwordForm.newPassword"
+            type="password"
+            show-password
+            placeholder="至少 6 位"
+          />
+        </el-form-item>
+        <el-form-item label="确认新密码" prop="confirmPassword">
+          <el-input
+            v-model="passwordForm.confirmPassword"
+            type="password"
+            show-password
+            placeholder="再次输入新密码"
+          />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="passwordDialogVisible = false">取消</el-button>
+        <el-button type="primary" :loading="passwordSubmitting" @click="submitPasswordChange">
+          确定修改
+        </el-button>
+      </template>
+    </el-dialog>
   </el-container>
 </template>
 
 <style scoped>
-.main-layout {
+.platform-shell {
   height: 100vh;
   width: 100vw;
 }
 
-.sidebar {
+.nav-sidebar {
   background: #001529;
   display: flex;
   flex-direction: column;
   overflow-x: hidden;
 }
 
-.logo-area {
+.brand-banner {
   height: 60px;
   display: flex;
   align-items: center;
@@ -315,16 +514,16 @@ function onSwitchRole(role: 'sys_admin' | 'school_admin' | 'teacher') {
   letter-spacing: 1px;
 }
 
-.logo-icon {
+.brand-emblem {
   font-size: 22px;
 }
 
-.nav-menu {
+.role-nav-menu {
   flex: 1;
   border-right: none;
 }
 
-.header {
+.top-bar {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -333,14 +532,14 @@ function onSwitchRole(role: 'sys_admin' | 'school_admin' | 'teacher') {
   padding: 0 24px;
 }
 
-.header-left {
+.top-bar-left {
   display: flex;
   align-items: center;
   gap: 20px;
 }
 
-.school-info,
-.class-info {
+.school-identity,
+.class-identity {
   display: flex;
   align-items: center;
   gap: 4px;
@@ -348,18 +547,18 @@ function onSwitchRole(role: 'sys_admin' | 'school_admin' | 'teacher') {
   color: #606266;
 }
 
-.class-select-wrap {
+.class-picker {
   display: flex;
   align-items: center;
   gap: 6px;
 }
 
-.header-right {
+.top-bar-right {
   display: flex;
   align-items: center;
 }
 
-.user-dropdown-trigger {
+.account-menu-trigger {
   display: flex;
   align-items: center;
   gap: 8px;
@@ -369,35 +568,35 @@ function onSwitchRole(role: 'sys_admin' | 'school_admin' | 'teacher') {
   transition: background 0.2s;
 }
 
-.user-dropdown-trigger:hover {
+.account-menu-trigger:hover {
   background: #f5f7fa;
 }
 
-.user-name {
+.account-name {
   font-size: 14px;
   color: #303133;
 }
 
-.main-content {
+.page-viewport {
   background: #f5f7fa;
   padding: 20px;
   overflow-y: auto;
 }
 
-.role-switch-trigger {
+.role-switch-entry {
   display: flex;
   align-items: center;
   gap: 6px;
   width: 100%;
 }
 
-.role-current-tag {
+.role-current-hint {
   color: #909399;
   font-size: 12px;
   margin-left: 8px;
 }
 
-.view-switch {
+.teacher-view-toggle {
   display: flex;
   align-items: center;
   gap: 6px;
@@ -408,16 +607,16 @@ function onSwitchRole(role: 'sys_admin' | 'school_admin' | 'teacher') {
   margin-right: 16px;
 }
 
-.view-switch:hover {
+.teacher-view-toggle:hover {
   background: #f0f5ff;
 }
 
-.view-switch-hint {
+.teacher-view-hint {
   font-size: 11px;
   color: #909399;
 }
 
-.mobile-menu-btn {
+.mobile-nav-toggle {
   display: flex;
   align-items: center;
   justify-content: center;
@@ -428,20 +627,20 @@ function onSwitchRole(role: 'sys_admin' | 'school_admin' | 'teacher') {
   color: #303133;
   margin-right: 8px;
 }
-.mobile-menu-btn:hover { background: #f0f5ff; }
+.mobile-nav-toggle:hover { background: #f0f5ff; }
 
-.sidebar-drawer {
+.nav-sidebar-drawer {
   height: 100%;
   width: 100%;
 }
 
 /* 移动端媒体查询 */
 @media (max-width: 768px) {
-  .header-left { gap: 8px; }
-  .school-info, .class-info { display: none; }
-  .user-name { display: none; }
-  .view-switch-hint { display: none; }
-  .main-content { padding: 12px; }
-  .header-right { gap: 6px; }
+  .top-bar-left { gap: 8px; }
+  .school-identity, .class-identity { display: none; }
+  .account-name { display: none; }
+  .teacher-view-hint { display: none; }
+  .page-viewport { padding: 12px; }
+  .top-bar-right { gap: 6px; }
 }
 </style>

@@ -10,6 +10,7 @@ export interface UserState {
   className: string | null
 }
 
+/** 学校。注意：schools 表同时存在 school_name 与兼容列 name，查询时要两者都兜底 */
 export interface School {
   id: string
   name: string
@@ -48,6 +49,7 @@ export interface ScoreLog {
   created_at?: string
 }
 
+/** 作业科目。subject_name 是业务列名，name 是同义的兼容列，两列都要读 */
 export interface HomeworkSubject {
   id: string
   subject_name: string

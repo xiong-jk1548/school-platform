@@ -18,22 +18,26 @@ const students = ref<StudentRow[]>([])
 const loading = ref(false)
 const topN = ref(10)
 
+/**
+ * 按总积分倒序加载本班学生（最多 50 条），并兼容 name 字段补齐 student_name
+ * @returns 无返回值（副作用：写入 students，并在 finally 中复位 loading）
+ */
 async function loadStudents() {
   if (!userStore.classId) return
   loading.value = true
   try {
-    const { data, error } = await supabase
+    const { data: studentRows, error } = await supabase
       .from('students')
       .select('id, student_name, total_score')
       .eq('class_id', userStore.classId)
       .order('total_score', { ascending: false })
       .limit(50)
     if (error) throw error
-    const rows = (data ?? []) as StudentRow[]
-    rows.forEach((s: any) => { if (!s.student_name && s.name) s.student_name = s.name })
-    students.value = rows
-  } catch (err: any) {
-    ElMessage.error(err.message || '加载排行榜失败')
+    const rankedStudents = (studentRows ?? []) as StudentRow[]
+    rankedStudents.forEach((student: any) => { if (!student.student_name && student.name) student.student_name = student.name })
+    students.value = rankedStudents
+  } catch (err: unknown) {
+    ElMessage.error(err instanceof Error && err.message ? err.message : '加载排行榜失败')
   } finally {
     loading.value = false
   }
@@ -73,12 +77,12 @@ onMounted(loadStudents)
         </template>
       </el-table-column>
       <el-table-column prop="student_name" label="姓名" min-width="140">
-        <template #default="{ row }">{{ row.student_name || row.name }}</template>
+        <template #default="{ row: studentRow }">{{ studentRow.student_name || studentRow.name }}</template>
       </el-table-column>
       <el-table-column label="总积分" min-width="120" align="center">
-        <template #default="{ row }">
-          <el-tag :type="(row.total_score ?? 0) >= 0 ? 'success' : 'danger'" size="large" effect="dark">
-            {{ row.total_score ?? 0 }}
+        <template #default="{ row: studentRow }">
+          <el-tag :type="(studentRow.total_score ?? 0) >= 0 ? 'success' : 'danger'" size="large" effect="dark">
+            {{ studentRow.total_score ?? 0 }}
           </el-tag>
         </template>
       </el-table-column>

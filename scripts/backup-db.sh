@@ -8,8 +8,13 @@
 #   定时任务：      crontab -e，添加下面一行
 #                    0 2 * * * /path/to/backup-db.sh >> /var/log/backup-db.log 2>&1
 #
-# 环境变量（按需修改下面的配置区）：
-#   PGHOST / PGPORT / PGUSER / PGPASSWORD / PGDATABASE
+# 环境变量（都有默认值，可在 crontab 或 shell 里 export 覆盖）：
+#   PGHOST     数据库主机，默认 127.0.0.1
+#   PGPORT     数据库端口，默认 5432
+#   PGUSER     连接用户，默认 supabase
+#   PGDATABASE 库名，默认 postgres
+#   PGPASSWORD 连接密码；留空时 pg_dump 会转成交互式输入密码，
+#              在 crontab 下没有终端，必须先 export 再跑
 # ============================================================
 
 set -euo pipefail
@@ -61,6 +66,7 @@ if pg_dump \
     -f "${BACKUP_FILE}"; then
     echo "[成功] 备份完成: ${BACKUP_FILE} ($(du -h ${BACKUP_FILE} | cut -f1))"
 else
+    # 处于 if 的 else 分支，$? 保留的仍是刚失败的 pg_dump 的退出码
     echo "[失败] pg_dump 退出码 $?"
     exit 1
 fi

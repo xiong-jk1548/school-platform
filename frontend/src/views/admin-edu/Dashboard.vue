@@ -29,13 +29,17 @@ const quickLinks = [
   { path: '/admin-edu/reports', title: '统计报表', desc: '查看全区积分统计', icon: DataAnalysis, color: '#fa8c16' },
 ]
 
+/**
+ * 加载教育局工作台顶部的四项统计数字：学校数、学校管理员数、教师数、学生数。
+ * @returns 无返回值，统计结果写入 summary，供模板渲染
+ */
 async function loadData() {
   try {
     const [
-      { count: sc },
-      { count: sac },
-      { count: tc },
-      { count: stc },
+      { count: schoolTotal },
+      { count: schoolAdminTotal },
+      { count: teacherTotal },
+      { count: studentTotal },
     ] = await Promise.all([
       supabase.from('schools').select('*', { count: 'exact', head: true }),
       supabase
@@ -49,18 +53,22 @@ async function loadData() {
       supabase.from('students').select('*', { count: 'exact', head: true }),
     ])
     summary.value = {
-      schoolCount: sc ?? 0,
-      schoolAdminCount: sac ?? 0,
-      teacherCount: tc ?? 0,
-      studentCount: stc ?? 0,
+      schoolCount: schoolTotal ?? 0,
+      schoolAdminCount: schoolAdminTotal ?? 0,
+      teacherCount: teacherTotal ?? 0,
+      studentCount: studentTotal ?? 0,
     }
   } catch {
-    /* 静默失败 */
+    /* 统计只是首屏辅助信息，查询失败时静默忽略，不影响工作台其余内容展示 */
   }
 }
 
-function goTo(path: string) {
-  router.push(path)
+/**
+ * 跳转到快捷入口对应的页面。
+ * @param targetPath 目标路由地址
+ */
+function goTo(targetPath: string) {
+  router.push(targetPath)
 }
 
 onMounted(loadData)
@@ -74,7 +82,7 @@ onMounted(loadData)
           <div class="welcome-greeting">
             您好，{{ userStore.name ?? userStore.email ?? '教育局管理员' }}
           </div>
-          <div class="welcome-sub">欢迎回到多校学生积分管理平台</div>
+          <div class="welcome-sub">欢迎回到智慧校园管理平台</div>
         </div>
         <div class="welcome-right">
           <el-icon :size="48" color="#1E6FD9"><OfficeBuilding /></el-icon>

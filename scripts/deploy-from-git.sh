@@ -13,6 +13,11 @@
 # 或直接：
 #   git clone https://github.com/你的用户名/school-platform.git /opt/school-platform
 #   cd /opt/school-platform && bash scripts/deploy-from-git.sh
+#
+# 可覆盖的环境变量：
+#   GIT_URL    仓库地址；未设置且目标目录不是 git 仓库时直接报错退出
+#   CLONE_DIR  代码落地目录，默认 /opt/school-platform
+#   BRANCH     分支名，默认 main，clone 与 pull 都用它
 # ============================================================
 set -euo pipefail
 
@@ -59,7 +64,7 @@ echo "=============================================="
 docker compose -p school-platform up -d db rest auth kong
 
 echo "⏳ 等待 DB ready..."
-for i in $(seq 1 30); do
+for attempt in $(seq 1 30); do
   if docker exec supabase-db pg_isready -U supabase -d postgres 2>/dev/null | grep -q "accepting"; then
     echo "✔ DB ready"
     break

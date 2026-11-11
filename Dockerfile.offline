@@ -1,0 +1,25 @@
+# ============================================================
+# 离线版前端镜像构建（无需 node:20-alpine 基础镜像 / 无需联网拉镜像）
+# 适用：任何离线机器上修改前端源码后重打包 school-platform-web:latest
+#
+# 构建步骤（在 project/ 目录下）：
+#   1. 先在本机用 Node 编译前端产物（需 npm，走 npmmirror）：
+#        cd frontend
+#        npm ci --registry=https://registry.npmmirror.com --replace-registry-host=always
+#        VITE_USE_REAL_SUPABASE=true \
+#        VITE_SUPABASE_URL=http://127.0.0.1:8000 \
+#        VITE_SUPABASE_ANON_KEY=<与 .env 一致的 anon key> \
+#        npm run build          # 产出 frontend/dist
+#      注意：npm run build 实际是 `vue-tsc -b && vite build`，先做全量类型检查，
+#            类型不过就不出 dist，镜像也会跟着构建失败。
+#   2. 再构建镜像（nginx:alpine 本地已有，不触发拉取）：
+#        docker build -f Dockerfile.offline -t school-platform-web:latest .
+#   3. 重建 web 容器：
+#        docker compose -p school-platform up -d web
+# ============================================================
+
+FROM nginx:alpine
+COPY deploy/nginx.conf /etc/nginx/conf.d/default.conf
+COPY frontend/dist /usr/share/nginx/html
+EXPOSE 80
+CMD ["nginx", "-g", "daemon off;"]

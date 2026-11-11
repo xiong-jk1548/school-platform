@@ -33,12 +33,18 @@ const submitting = ref(false)
 
 const showCustomRemark = ref(false)
 
+// 暴露给父组件（学生管理页）通过 ref 调用的开窗方法
 defineExpose({
-  open(row: StudentRow, type: 'add' | 'deduct') {
-    currentStudent.value = row
+  /**
+   * 打开积分变动弹窗
+   * @param student 被操作的学生
+   * @param type 操作类型：add 加分 / deduct 扣分（决定标题文案与默认分值）
+   */
+  open(student: StudentRow, type: 'add' | 'deduct') {
+    currentStudent.value = student
     dialogTitle.value = type === 'add'
-      ? `给 ${row.student_name || row.name} 加分`
-      : `给 ${row.student_name || row.name} 扣分`
+      ? `给 ${student.student_name || student.name} 加分`
+      : `给 ${student.student_name || student.name} 扣分`
     scoreValue.value = type === 'add' ? 1 : -1
     remarkSelected.value = ''
     remarkCustom.value = ''
@@ -47,11 +53,20 @@ defineExpose({
   },
 })
 
+/**
+ * 计算最终生效的积分变动原因：下拉选择「其他」时取自定义输入并去除首尾空格
+ * @returns 积分变动原因文本（可能为空字符串）
+ */
 function effectiveRemark(): string {
   if (remarkSelected.value === '__other__') return remarkCustom.value.trim()
   return remarkSelected.value
 }
 
+/**
+ * 提交本次积分变动
+ * 调用数据库函数 fn_change_student_score 完成加分/扣分，成功后关闭弹窗并通知父组件刷新列表
+ * @returns 无返回值（副作用：写入 score_log 流水、关闭弹窗、emit submitted 事件）
+ */
 async function handleSubmitScore() {
   if (!currentStudent.value) return
   const remark = effectiveRemark()
@@ -70,8 +85,8 @@ async function handleSubmitScore() {
     ElMessage.success('积分操作成功')
     dialogVisible.value = false
     emit('submitted')
-  } catch (err: any) {
-    ElMessage.error(err.message || '积分操作失败')
+  } catch (err: unknown) {
+    ElMessage.error(err instanceof Error && err.message ? err.message : '积分操作失败')
   } finally {
     submitting.value = false
   }
@@ -95,13 +110,13 @@ async function handleSubmitScore() {
           v-model="remarkSelected"
           placeholder="请选择积分变动原因"
           style="width: 100%"
-          @change="(v: string) => { showCustomRemark = v === '__other__' }"
+          @change="(selectedRemark: string) => { showCustomRemark = selectedRemark === '__other__' }"
         >
           <el-option
-            v-for="opt in REMARK_OPTIONS"
-            :key="opt.value"
-            :label="opt.label"
-            :value="opt.value"
+            v-for="remarkOption in REMARK_OPTIONS"
+            :key="remarkOption.value"
+            :label="remarkOption.label"
+            :value="remarkOption.value"
           />
         </el-select>
       </el-form-item>

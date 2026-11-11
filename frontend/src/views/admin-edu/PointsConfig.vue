@@ -66,20 +66,28 @@ const rules = reactive<FormRules<AdminForm>>({
   ],
 })
 
+/**
+ * 加载「所属学校」下拉选项，只取学校 id 与名称并按名称排序。
+ * @returns 无返回值，选项写入 schoolOptions
+ */
 async function loadSchools() {
-  const { data, error } = await supabase
+  const { data: schoolRows, error } = await supabase
     .from('schools')
     .select('id, name')
     .order('name')
   if (!error) {
-    schoolOptions.value = (data ?? []) as SchoolOption[]
+    schoolOptions.value = (schoolRows ?? []) as SchoolOption[]
   }
 }
 
+/**
+ * 加载学校管理员列表，并联表 schools 取出所属学校名称。
+ * @returns 无返回值，列表写入 tableData
+ */
 async function loadData() {
   loading.value = true
   try {
-    const { data, error } = await supabase
+    const { data: profileRows, error } = await supabase
       .from('profiles')
       .select(
         `id, real_name, email, phone, role, school_id, created_at,
@@ -88,15 +96,17 @@ async function loadData() {
       .eq('role', 'school_admin')
       .order('created_at', { ascending: false })
     if (error) throw error
-    tableData.value = ((data ?? []) as any[]).map((row) => ({
-      id: row.id,
-      real_name: row.real_name ?? '',
-      email: row.email ?? '',
-      phone: row.phone ?? '',
-      role: row.role,
-      school_id: row.school_id,
-      school_name: row.schools?.name ?? '-',
-      created_at: row.created_at,
+    // 坑：所属学校一列曾直接渲染 school_id，界面上显示成一串 UUID，
+    // 这里改为联表取 schools.name 展示（见“学校列表显示 UUID”那次排查）
+    tableData.value = ((profileRows ?? []) as any[]).map((profile) => ({
+      id: profile.id,
+      real_name: profile.real_name ?? '',
+      email: profile.email ?? '',
+      phone: profile.phone ?? '',
+      role: profile.role,
+      school_id: profile.school_id,
+      school_name: profile.schools?.name ?? '-',
+      created_at: profile.created_at,
     }))
   } catch (err: unknown) {
     ElMessage.error(err instanceof Error ? err.message : '加载列表失败')
@@ -105,6 +115,10 @@ async function loadData() {
   }
 }
 
+/**
+ * 打开「新增学校管理员」弹窗，并把表单重置为默认初始密码。
+ * @returns 无返回值，仅切换弹窗状态
+ */
 function openAdd() {
   isEdit.value = false
   dialogTitle.value = '新增学校管理员'
@@ -118,20 +132,29 @@ function openAdd() {
   dialogVisible.value = true
 }
 
-function openEdit(row: ProfileRow) {
+/**
+ * 打开「编辑学校管理员」弹窗，用选中记录回填表单（编辑态不允许改手机号）。
+ * @param profile 表格中选中的管理员记录
+ * @returns 无返回值，仅切换弹窗状态
+ */
+function openEdit(profile: ProfileRow) {
   isEdit.value = true
   dialogTitle.value = '编辑学校管理员'
   Object.assign(form, {
-    id: row.id,
-    real_name: row.real_name,
-    email: row.email,
-    phone: row.phone ?? '',
-    school_id: row.school_id ?? '',
+    id: profile.id,
+    real_name: profile.real_name,
+    email: profile.email,
+    phone: profile.phone ?? '',
+    school_id: profile.school_id ?? '',
     password: '',
   })
   dialogVisible.value = true
 }
 
+/**
+ * 提交弹窗表单：编辑态直接更新 profiles，新增态交给 createSchoolAdmin 处理。
+ * @returns 无返回值，成功后关闭弹窗并刷新列表
+ */
 async function handleSubmit() {
   const valid = await formRef.value?.validate().catch(() => false)
   if (!valid) return
@@ -160,9 +183,16 @@ async function handleSubmit() {
   }
 }
 
+/**
+ * 新增学校管理员：优先调用 create_school_admin RPC（由数据库完成 auth 账号创建与去重），
+ * RPC 不可用时回退为「signUp 建号 + 写入 profiles」的旧流程。
+ * @returns 无返回值，创建失败时抛出异常交由调用方提示
+ */
 async function createSchoolAdmin() {
   try {
-    const { error: rpcErr } = await supabase.rpc(
+    // 坑：直接建 auth 账号时 phone/email 重复会返回 409，
+    // 改走 create_school_admin RPC 由数据库侧自动去重（见“新增学校管理员 409”那次排查）
+    const { error: rpcError } = await supabase.rpc(
       'create_school_admin',
       {
         p_phone: form.phone,
@@ -172,7 +202,7 @@ async function createSchoolAdmin() {
         p_school_id: form.school_id,
       },
     )
-    if (!rpcErr) {
+    if (!rpcError) {
       ElMessage.success('学校管理员创建成功')
       return
     }
@@ -180,7 +210,7 @@ async function createSchoolAdmin() {
     /* rpc 不存在，走 fallback */
   }
 
-  const { data, error } = await supabase.auth.signUp({
+  const { data: signUpData, error } = await supabase.auth.signUp({
     email: form.email || form.phone + '@demo.local',
     password: form.password!,
     options: {
@@ -193,10 +223,10 @@ async function createSchoolAdmin() {
     },
   })
   if (error) throw error
-  if (!data.user) throw new Error('创建用户失败')
+  if (!signUpData.user) throw new Error('创建用户失败')
 
   const { error: profErr } = await supabase.from('profiles').insert({
-    id: data.user.id,
+    id: signUpData.user.id,
     email: form.email || null,
     phone: form.phone,
     real_name: form.real_name,
@@ -208,14 +238,19 @@ async function createSchoolAdmin() {
   ElMessage.success('学校管理员创建成功')
 }
 
-async function handleDelete(row: ProfileRow) {
+/**
+ * 删除学校管理员：先二次确认，再从 profiles 中删除该记录。
+ * @param profile 表格中选中的管理员记录
+ * @returns 无返回值，用户取消确认时不做任何提示
+ */
+async function handleDelete(profile: ProfileRow) {
   try {
     await ElMessageBox.confirm(
-      `确定要删除学校管理员「${row.real_name || row.email}」吗？`,
+      `确定要删除学校管理员「${profile.real_name || profile.email}」吗？`,
       '危险操作',
       { type: 'error', confirmButtonText: '删除' },
     )
-    const { error } = await supabase.from('profiles').delete().eq('id', row.id)
+    const { error } = await supabase.from('profiles').delete().eq('id', profile.id)
     if (error) throw error
     ElMessage.success('删除成功')
     await loadData()
@@ -259,10 +294,10 @@ onMounted(async () => {
       <el-table
         :data="
           tableData.filter(
-            (u) =>
+            (profile) =>
               !searchKw ||
-              u.real_name.toLowerCase().includes(searchKw.toLowerCase()) ||
-              u.email.toLowerCase().includes(searchKw.toLowerCase()),
+              profile.real_name.toLowerCase().includes(searchKw.toLowerCase()) ||
+              profile.email.toLowerCase().includes(searchKw.toLowerCase()),
           )
         "
         v-loading="loading"
@@ -278,20 +313,20 @@ onMounted(async () => {
           </template>
         </el-table-column>
         <el-table-column prop="created_at" label="创建时间" width="180">
-          <template #default="{ row }">
-            {{ row.created_at ? new Date(row.created_at).toLocaleString() : '-' }}
+          <template #default="{ row: profile }">
+            {{ profile.created_at ? new Date(profile.created_at).toLocaleString() : '-' }}
           </template>
         </el-table-column>
         <el-table-column label="操作" width="180" fixed="right" align="center">
-          <template #default="{ row }">
-            <el-button link type="primary" :icon="Edit" @click="openEdit(row as ProfileRow)">
+          <template #default="{ row: profile }">
+            <el-button link type="primary" :icon="Edit" @click="openEdit(profile as ProfileRow)">
               编辑
             </el-button>
             <el-button
               link
               type="danger"
               :icon="Delete"
-              @click="handleDelete(row as ProfileRow)"
+              @click="handleDelete(profile as ProfileRow)"
             >
               删除
             </el-button>
@@ -332,10 +367,10 @@ onMounted(async () => {
             style="width: 100%"
           >
             <el-option
-              v-for="s in schoolOptions"
-              :key="s.id"
-              :value="s.id"
-              :label="s.name"
+              v-for="school in schoolOptions"
+              :key="school.id"
+              :value="school.id"
+              :label="school.name"
             />
           </el-select>
         </el-form-item>

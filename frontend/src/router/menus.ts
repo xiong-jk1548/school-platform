@@ -1,6 +1,7 @@
 import type { Component } from 'vue'
 import type { Role } from '@/types'
 
+/** 教师角色的视图模式：frontend=班级前端（日常使用），backend=班级后台（数据管理） */
 export type TeacherView = 'frontend' | 'backend'
 
 export interface MenuItem {
@@ -8,21 +9,29 @@ export interface MenuItem {
   title: string
   icon?: string
   roles: Role[]
-  teacherView?: TeacherView[] // 教师角色下可见的视图模式（不写则都可见）
+  /** 该菜单在教师角色下可见的视图模式；不写表示 frontend / backend 都可见 */
+  teacherView?: TeacherView[]
   component: () => Promise<Component>
 }
 
-const modules = import.meta.glob<Record<string, () => Promise<Component>>>(
+// 一次性登记 views 与 modules 两个目录下的全部页面组件（懒加载，不 eager）
+const pageModules = import.meta.glob<Record<string, () => Promise<Component>>>(
   ['@/views/**/*.vue', '@/modules/**/*.vue'],
   { eager: false, import: 'default' },
 )
 
+/**
+ * 把菜单里的相对路径解析成组件的懒加载工厂。
+ * @param relativePath 相对 views/ 或 modules/ 的页面路径，例如 'teacher/Leaderboard.vue'
+ * @returns () => Promise<Component> 该页面的动态 import 工厂，直接赋给 MenuItem.component
+ * @throws Error 两个目录都登记不到该路径时抛出（否则点菜单必然白屏，故让它尽早暴露）
+ */
 function loadView(relativePath: string) {
   const viewKey = `/src/views/${relativePath}`
   const moduleKey = `/src/modules/${relativePath}`
   const loader =
-    (modules as unknown as Record<string, () => Promise<Component>>)[viewKey] ??
-    (modules as unknown as Record<string, () => Promise<Component>>)[moduleKey]
+    (pageModules as unknown as Record<string, () => Promise<Component>>)[viewKey] ??
+    (pageModules as unknown as Record<string, () => Promise<Component>>)[moduleKey]
   if (!loader) throw new Error(`找不到视图文件: ${relativePath}`)
   return loader
 }
@@ -39,6 +48,7 @@ export const navMenus: MenuItem[] = [
   { path: '/admin-school/student-import', title: '导入学生', icon: 'UploadFilled', roles: ['school_admin'], component: loadView('school/student-import.vue') },
   { path: '/admin-school/students', title: '学生列表', icon: 'Avatar', roles: ['school_admin'], component: loadView('school/student-list.vue') },
   { path: '/admin-school/logs', title: '积分流水', icon: 'Tickets', roles: ['school_admin'], component: loadView('school/log-list.vue') },
+  { path: '/admin-school/inspection', title: '班级检查扣分', icon: 'TrendCharts', roles: ['school_admin'], component: loadView('school/inspection-deduct.vue') },
 
   // 教师 · 前端（班级日常使用 — 高频在上，大件作业/借阅放底部）
   { path: '/teacher/frontend/random-picker', title: '随机点名', icon: 'MagicStick', roles: ['teacher'], teacherView: ['frontend'], component: loadView('teacher/RandomPicker.vue') },

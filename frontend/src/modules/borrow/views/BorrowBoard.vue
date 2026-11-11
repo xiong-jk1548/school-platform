@@ -51,11 +51,11 @@ interface BorrowForm {
   description: string
 }
 
-const items = ref<ItemRow[]>([])
-const loading = ref(false)
+const borrowItemList = ref<ItemRow[]>([])
+const itemsLoading = ref(false)
 const schoolClasses = ref<ClassOpt[]>([])
 const filterClassId = ref<string>('')
-const searchKey = ref('')
+const itemSearchKeyword = ref('')
 
 const borrowDialogVisible = ref(false)
 const borrowForm = ref({
@@ -83,33 +83,62 @@ const itemForm = ref<BorrowForm>({
 
 const recentBorrowerMap = ref<Record<string, string>>({})
 
-const students = ref<StudentOpt[]>([])
+// 常用物品类型预设（可下拉选择，也可直接输入自定义类型）
+const PRESET_ITEM_TYPES = [
+  '体育器材', '文具教具', '图书绘本', '实验器材',
+  '清洁工具', '电子产品', '艺术用品', '生活用品',
+]
 
-const filteredItems = computed(() => {
-  const kw = searchKey.value.trim().toLowerCase()
-  if (!kw) return items.value
-  return items.value.filter((it) => it.item_name.toLowerCase().includes(kw))
+/** 物品类型下拉选项：预设类型 + 台账中已存在的自定义类型 */
+const itemTypeOptions = computed(() => {
+  const existingTypes = new Set(
+    borrowItemList.value.map((borrowItem) => borrowItem.type).filter((typeName): typeName is string => !!typeName),
+  )
+  const presetOptions = PRESET_ITEM_TYPES.map((typeName) => ({
+    value: typeName,
+    label: existingTypes.has(typeName) ? typeName : typeName,
+  }))
+  const customTypeOptions = Array.from(existingTypes)
+    .filter((typeName) => !PRESET_ITEM_TYPES.includes(typeName))
+    .map((typeName) => ({ value: typeName, label: typeName }))
+  return [...presetOptions, ...customTypeOptions]
 })
 
+const studentOptions = ref<StudentOpt[]>([])
+
+/** 按搜索关键词过滤后的物品列表，用于表格展示 */
+const filteredItems = computed(() => {
+  const itemKeyword = itemSearchKeyword.value.trim().toLowerCase()
+  if (!itemKeyword) return borrowItemList.value
+  return borrowItemList.value.filter((borrowItem) => borrowItem.item_name.toLowerCase().includes(itemKeyword))
+})
+
+/**
+ * 加载班级下拉数据。
+ * 借阅是**校内公开**的数据（RLS 已按 school_id 放行），教师与学生管理员一样
+ * 可以浏览全校物品，因此这里统一加载本校全部班级，默认不筛选（全部班级）。
+ * @returns 无返回值（副作用：写入 schoolClasses；filterClassId 保持为空＝全部）
+ */
 async function loadSchoolClasses() {
+  if (!userStore.schoolId) return
   try {
-    if (userStore.role === 'teacher' && userStore.classId) {
-      schoolClasses.value = [{ id: userStore.classId, class_name: userStore.className || '我的班级' }]
-      filterClassId.value = userStore.classId
-    } else if (userStore.role === 'school_admin' && userStore.schoolId) {
-      const { data, error } = await supabase
-        .from('classes')
-        .select('id, class_name')
-        .eq('school_id', userStore.schoolId)
-      if (error) throw error
-      schoolClasses.value = (data ?? []) as ClassOpt[]
-      filterClassId.value = ''
-    }
-  } catch (err: any) {
-    ElMessage.error(err.message || '加载班级失败')
+    const { data: classRows, error } = await supabase
+      .from('classes')
+      .select('id, class_name')
+      .eq('school_id', userStore.schoolId)
+    if (error) throw error
+    schoolClasses.value = (classRows ?? []) as ClassOpt[]
+    filterClassId.value = ''
+  } catch (err: unknown) {
+    ElMessage.error(err instanceof Error && err.message ? err.message : '加载班级失败')
   }
 }
 
+/**
+ * 加载借出学生下拉数据。
+ * 已选班级时按班级过滤；学校管理员未选班级时按学校范围过滤。
+ * @returns 无返回值（副作用：写入 studentOptions）
+ */
 async function loadStudents() {
   try {
     let query = supabase
@@ -121,20 +150,25 @@ async function loadStudents() {
     } else if (userStore.schoolId) {
       query = query.eq('school_id', userStore.schoolId)
     } else {
-      students.value = []
+      studentOptions.value = []
       return
     }
-    const { data, error } = await query
+    const { data: studentRows, error } = await query
     if (error) throw error
-    students.value = (data ?? []) as StudentOpt[]
-  } catch (err: any) {
-    ElMessage.error(err.message || '加载学生列表失败')
+    studentOptions.value = (studentRows ?? []) as StudentOpt[]
+  } catch (err: unknown) {
+    ElMessage.error(err instanceof Error && err.message ? err.message : '加载学生列表失败')
   }
 }
 
+/**
+ * 加载物品台账列表，并在列表就绪后刷新「最近借出人」展示。
+ * 已选班级时按班级查询，否则按所属学校查询。
+ * @returns 无返回值（副作用：写入 borrowItemList，并触发 loadRecentBorrowers）
+ */
 async function loadItems() {
   if (!userStore.schoolId) return
-  loading.value = true
+  itemsLoading.value = true
   try {
     let query = supabase
       .from('borrow_items')
@@ -145,177 +179,202 @@ async function loadItems() {
     } else {
       query = query.eq('school_id', userStore.schoolId)
     }
-    const { data, error } = await query
+    const { data: itemRows, error } = await query
     if (error) throw error
-    items.value = (data ?? []) as ItemRow[]
+    borrowItemList.value = (itemRows ?? []) as ItemRow[]
     await loadRecentBorrowers()
-  } catch (err: any) {
-    ElMessage.error(err.message || '加载物品列表失败')
+  } catch (err: unknown) {
+    ElMessage.error(err instanceof Error && err.message ? err.message : '加载物品列表失败')
   } finally {
-    loading.value = false
+    itemsLoading.value = false
   }
 }
 
+/**
+ * 统计每件物品最近一次「借出中」记录对应的学生姓名，用于列表展示。
+ * 先按物品 ID 批量取出未归还的借阅记录，再一次性换取学生姓名，避免逐条查询。
+ * @returns 无返回值（副作用：写入 recentBorrowerMap）
+ */
 async function loadRecentBorrowers() {
-  if (items.value.length === 0) {
+  if (borrowItemList.value.length === 0) {
     recentBorrowerMap.value = {}
     return
   }
-  const itemIds = items.value.map((it) => it.id)
+  const borrowedItemIds = borrowItemList.value.map((borrowItem) => borrowItem.id)
   try {
-    const { data: records, error: rErr } = await supabase
+    const { data: borrowRecords, error: recordsError } = await supabase
       .from('borrow_records')
       .select('id, item_id, student_id, status, borrow_date')
       .eq('status', 'borrowed')
-      .in('item_id', itemIds)
+      .in('item_id', borrowedItemIds)
       .order('borrow_date', { ascending: false })
-    if (rErr) throw rErr
+    if (recordsError) throw recordsError
 
-    const stMap: Record<string, string> = {}
-    const uniqueIds = Array.from(new Set((records ?? []).map((r: any) => r.student_id)))
-    if (uniqueIds.length > 0) {
-      const { data: sts, error: sErr } = await supabase
+    const studentNameMap: Record<string, string> = {}
+    const studentIdList = Array.from(new Set((borrowRecords ?? []).map((recordRow: any) => recordRow.student_id)))
+    if (studentIdList.length > 0) {
+      const { data: studentRows, error: studentsError } = await supabase
         .from('students')
         .select('id, student_name')
-        .in('id', uniqueIds)
-      if (sErr) throw sErr
-      for (const s of (sts ?? []) as StudentOpt[]) {
-        stMap[s.id] = s.student_name
+        .in('id', studentIdList)
+      if (studentsError) throw studentsError
+      for (const studentRow of (studentRows ?? []) as StudentOpt[]) {
+        studentNameMap[studentRow.id] = studentRow.student_name
       }
     }
 
-    const map: Record<string, string> = {}
-    for (const r of (records ?? []) as any[]) {
-      if (!map[r.item_id]) {
-        map[r.item_id] = stMap[r.student_id] || r.student_id
+    const latestBorrowerMap: Record<string, string> = {}
+    for (const recordRow of (borrowRecords ?? []) as any[]) {
+      if (!latestBorrowerMap[recordRow.item_id]) {
+        latestBorrowerMap[recordRow.item_id] = studentNameMap[recordRow.student_id] || recordRow.student_id
       }
     }
-    recentBorrowerMap.value = map
-  } catch (err: any) {
-    ElMessage.error(err.message || '加载最近借出人失败')
+    recentBorrowerMap.value = latestBorrowerMap
+  } catch (err: unknown) {
+    ElMessage.error(err instanceof Error && err.message ? err.message : '加载最近借出人失败')
   }
 }
 
-function openBorrowDialog(row: ItemRow) {
-  if (row.available_quantity <= 0) {
+/**
+ * 打开借出登记弹窗，并带出被借物品的基础信息。
+ * @param itemRow 被借出的物品行
+ * @returns 无返回值；物品无可用数量时仅提示，不打开弹窗
+ */
+function openBorrowDialog(itemRow: ItemRow) {
+  if (itemRow.available_quantity <= 0) {
     ElMessage.warning('该物品暂无可用数量')
     return
   }
   borrowForm.value = {
-    item_id: row.id,
-    item_name: row.item_name,
-    qty: Math.min(1, row.available_quantity),
+    item_id: itemRow.id,
+    item_name: itemRow.item_name,
+    qty: Math.min(1, itemRow.available_quantity),
     student_id: '',
     remark: '',
   }
   borrowDialogVisible.value = true
 }
 
+/**
+ * 提交借出登记：校验借出数量后写入一条 borrow_records 记录（默认 7 天后归还）。
+ * @returns 无返回值；成功后关闭弹窗并刷新物品列表
+ */
 async function submitBorrow() {
-  const f = borrowForm.value
-  if (!f.student_id) {
+  const borrowDraft = borrowForm.value
+  if (!borrowDraft.student_id) {
     ElMessage.warning('请选择借出学生')
     return
   }
-  if (f.qty <= 0) {
+  if (borrowDraft.qty <= 0) {
     ElMessage.warning('借出数量必须大于 0')
     return
   }
-  const item = items.value.find((it) => it.id === f.item_id)
-  if (!item) return
-  if (f.qty > item.available_quantity) {
-    ElMessage.warning(`借出数量超过可用数量 ${item.available_quantity}`)
+  const targetItem = borrowItemList.value.find((borrowItem) => borrowItem.id === borrowDraft.item_id)
+  if (!targetItem) return
+  if (borrowDraft.qty > targetItem.available_quantity) {
+    ElMessage.warning(`借出数量超过可用数量 ${targetItem.available_quantity}`)
     return
   }
   try {
-    const { data: st } = await supabase
+    const { data: studentRow } = await supabase
       .from('students')
       .select('student_name')
-      .eq('id', f.student_id)
+      .eq('id', borrowDraft.student_id)
       .maybeSingle()
-    const studentName = (st as any)?.student_name || ''
+    const studentName = (studentRow as any)?.student_name || ''
 
     const borrowDate = new Date().toISOString()
     const expectedReturn = new Date(Date.now() + 7 * 86400000).toISOString()
 
-    const studentClassId = students.value.find((s) => s.id === f.student_id)?.class_id || filterClassId.value || undefined
+    const studentClassId = studentOptions.value.find((studentOption) => studentOption.id === borrowDraft.student_id)?.class_id || filterClassId.value || userStore.classId || undefined
 
     const { error } = await supabase
       .from('borrow_records')
       .insert({
-        item_id: f.item_id,
-        student_id: f.student_id,
+        item_id: borrowDraft.item_id,
+        student_id: borrowDraft.student_id,
         borrower_name: studentName,
         borrow_date: borrowDate,
         expected_return_date: expectedReturn,
         status: 'borrowed',
-        qty: f.qty,
+        qty: borrowDraft.qty,
         school_id: userStore.schoolId,
         class_id: studentClassId,
         operator_user_id: userStore.id,
-        remark: f.remark || null,
+        remark: borrowDraft.remark || null,
       })
       .select()
     if (error) throw error
     ElMessage.success('借出登记成功')
     borrowDialogVisible.value = false
     await loadItems()
-  } catch (err: any) {
-    ElMessage.error(err.message || '借出登记失败')
+  } catch (err: unknown) {
+    ElMessage.error(err instanceof Error && err.message ? err.message : '借出登记失败')
   }
 }
 
-async function openRecordsDialog(row: ItemRow) {
-  currentItem.value = row
+/**
+ * 打开某件物品的归还记录弹窗，并加载它的全部借阅流水（含借出学生姓名）。
+ * @param itemRow 目标物品行
+ * @returns 无返回值（副作用：写入 currentItem 与 currentRecords）
+ */
+async function openRecordsDialog(itemRow: ItemRow) {
+  currentItem.value = itemRow
   recordDialogVisible.value = true
   recordsLoading.value = true
   try {
-    const { data, error } = await supabase
+    const { data: recordRows, error } = await supabase
       .from('borrow_records')
       .select('*')
-      .eq('item_id', row.id)
+      .eq('item_id', itemRow.id)
       .order('borrow_date', { ascending: false })
     if (error) throw error
-    const records = (data ?? []) as any[]
+    const borrowRecordRows = (recordRows ?? []) as any[]
 
-    const uniqueStIds = Array.from(new Set(records.map((r) => r.student_id)))
-    const stMap: Record<string, string> = {}
-    if (uniqueStIds.length > 0) {
-      const { data: sts } = await supabase
+    const studentIdList = Array.from(new Set(borrowRecordRows.map((recordRow) => recordRow.student_id)))
+    const studentNameMap: Record<string, string> = {}
+    if (studentIdList.length > 0) {
+      const { data: studentRows } = await supabase
         .from('students')
         .select('id, student_name')
-        .in('id', uniqueStIds)
-      for (const s of (sts ?? []) as StudentOpt[]) {
-        stMap[s.id] = s.student_name
+        .in('id', studentIdList)
+      for (const studentRow of (studentRows ?? []) as StudentOpt[]) {
+        studentNameMap[studentRow.id] = studentRow.student_name
       }
     }
 
-    currentRecords.value = records.map((r) => ({
-      id: r.id,
-      item_id: r.item_id,
-      student_id: r.student_id,
-      borrow_date: r.borrow_date,
-      return_time: r.return_time || r.actual_return_date,
-      status: r.status,
-      qty: r.qty ?? 1,
-      remark: r.remark,
-      borrower_name: r.borrower_name || stMap[r.student_id] || r.student_id,
+    currentRecords.value = borrowRecordRows.map((recordRow) => ({
+      id: recordRow.id,
+      item_id: recordRow.item_id,
+      student_id: recordRow.student_id,
+      borrow_date: recordRow.borrow_date,
+      return_time: recordRow.return_time || recordRow.actual_return_date,
+      status: recordRow.status,
+      qty: recordRow.qty ?? 1,
+      remark: recordRow.remark,
+      borrower_name: recordRow.borrower_name || studentNameMap[recordRow.student_id] || recordRow.student_id,
     }))
-  } catch (err: any) {
-    ElMessage.error(err.message || '加载归还记录失败')
+  } catch (err: unknown) {
+    ElMessage.error(err instanceof Error && err.message ? err.message : '加载归还记录失败')
   } finally {
     recordsLoading.value = false
   }
 }
 
-async function confirmReturn(rec: RecordRow) {
+/**
+ * 确认归还：把指定借阅记录的状态改为已归还，并记录归还时间。
+ * @param recordRow 待归还的借阅记录
+ * @returns 无返回值；成功后刷新记录弹窗与物品列表
+ */
+async function confirmReturn(recordRow: RecordRow) {
   try {
     await ElMessageBox.confirm(
-      `确认将「${currentItem.value?.item_name}」的 ${rec.borrower_name} ${rec.qty} 件登记为已归还？`,
+      `确认将「${currentItem.value?.item_name}」的 ${recordRow.borrower_name} ${recordRow.qty} 件登记为已归还？`,
       '确认归还',
       { type: 'warning' },
     )
   } catch {
+    // 用户在确认框中取消操作，此处直接结束，无需额外处理
     return
   }
   try {
@@ -327,16 +386,17 @@ async function confirmReturn(rec: RecordRow) {
         return_time: now,
         actual_return_date: now,
       })
-      .eq('id', rec.id)
+      .eq('id', recordRow.id)
     if (error) throw error
     ElMessage.success('归还成功')
     await openRecordsDialog(currentItem.value!)
     await loadItems()
-  } catch (err: any) {
-    ElMessage.error(err.message || '归还操作失败')
+  } catch (err: unknown) {
+    ElMessage.error(err instanceof Error && err.message ? err.message : '归还操作失败')
   }
 }
 
+/** 打开「新增物品」弹窗，并把表单重置为默认值 */
 function openAddItemDialog() {
   editingItem.value = null
   itemForm.value = {
@@ -349,88 +409,111 @@ function openAddItemDialog() {
   itemDialogVisible.value = true
 }
 
-function openEditItemDialog(row: ItemRow) {
-  editingItem.value = row
+/**
+ * 打开「编辑物品」弹窗，并把选中物品的字段回填到表单。
+ * @param itemRow 待编辑的物品行
+ * @returns 无返回值
+ */
+function openEditItemDialog(itemRow: ItemRow) {
+  editingItem.value = itemRow
   itemForm.value = {
-    item_name: row.item_name,
-    type: row.type,
-    total_quantity: row.total_quantity,
-    location: row.location || '',
-    description: row.description || '',
+    item_name: itemRow.item_name,
+    type: itemRow.type,
+    total_quantity: itemRow.total_quantity,
+    location: itemRow.location || '',
+    description: itemRow.description || '',
   }
   itemDialogVisible.value = true
 }
 
+/**
+ * 保存物品表单：编辑时按总数差额同步可用数量，新增时可用数量等于总数。
+ * @returns 无返回值；成功后关闭弹窗并刷新物品列表
+ */
 async function submitItem() {
-  const f = itemForm.value
-  if (!f.item_name.trim()) {
+  const itemDraft = itemForm.value
+  if (!itemDraft.item_name.trim()) {
     ElMessage.warning('请填写物品名称')
     return
   }
-  if (f.total_quantity <= 0) {
+  if (itemDraft.total_quantity <= 0) {
     ElMessage.warning('总数必须大于 0')
     return
   }
   try {
     if (editingItem.value) {
-      const availableDelta = f.total_quantity - editingItem.value.total_quantity
+      const availableDelta = itemDraft.total_quantity - editingItem.value.total_quantity
       const newAvailable = Math.max(0, editingItem.value.available_quantity + availableDelta)
       const { error } = await supabase
         .from('borrow_items')
         .update({
-          item_name: f.item_name,
-          type: f.type,
-          total_quantity: f.total_quantity,
-          location: f.location || null,
-          description: f.description || null,
+          item_name: itemDraft.item_name,
+          type: itemDraft.type,
+          total_quantity: itemDraft.total_quantity,
+          location: itemDraft.location || null,
+          description: itemDraft.description || null,
           available_quantity: newAvailable,
         })
         .eq('id', editingItem.value.id)
       if (error) throw error
       ElMessage.success('更新物品成功')
     } else {
+      // 物品的归属班级：优先跟随当前筛选的班级，未筛选时落到自己绑定的班。
+      // 注：借阅已改为**全校粒度**（RLS 只校验 school_id = 本校），class_id 仅用于分类展示，
+      // 不再有"必须挂本班否则 403"的限制；保留兜底是为了让物品有明确归属、便于按班筛选。
+      const classId = filterClassId.value || userStore.classId || undefined
+      if (userStore.role === 'teacher' && !classId) {
+        ElMessage.warning('未获取到班级信息，请稍后重试')
+        return
+      }
       const { error } = await supabase.from('borrow_items').insert({
-        item_name: f.item_name,
-        type: f.type,
-        total_quantity: f.total_quantity,
-        available_quantity: f.total_quantity,
-        location: f.location || null,
-        description: f.description || null,
+        item_name: itemDraft.item_name.trim(),
+        type: itemDraft.type?.trim() || '其他',
+        total_quantity: itemDraft.total_quantity,
+        available_quantity: itemDraft.total_quantity,
+        location: itemDraft.location || null,
+        description: itemDraft.description || null,
         school_id: userStore.schoolId,
-        class_id: filterClassId.value || undefined,
+        class_id: classId,
       })
       if (error) throw error
       ElMessage.success('新增物品成功')
     }
     itemDialogVisible.value = false
     await loadItems()
-  } catch (err: any) {
-    ElMessage.error(err.message || '保存物品失败')
+  } catch (err: unknown) {
+    ElMessage.error(err instanceof Error && err.message ? err.message : '保存物品失败')
   }
 }
 
-async function deleteItem(row: ItemRow) {
+/**
+ * 删除物品：存在「借出中」记录时禁止删除。
+ * @param itemRow 待删除的物品行
+ * @returns 无返回值；成功后刷新物品列表
+ */
+async function deleteItem(itemRow: ItemRow) {
   try {
-    await ElMessageBox.confirm(`确定删除物品「${row.item_name}」吗？`, '删除确认', { type: 'warning' })
+    await ElMessageBox.confirm(`确定删除物品「${itemRow.item_name}」吗？`, '删除确认', { type: 'warning' })
   } catch {
+    // 用户在确认框中取消删除，直接结束
     return
   }
   try {
     const { data: borrowedRecords } = await supabase
       .from('borrow_records')
       .select('id')
-      .eq('item_id', row.id)
+      .eq('item_id', itemRow.id)
       .eq('status', 'borrowed')
     if ((borrowedRecords ?? []).length > 0) {
       ElMessage.warning('该物品尚有未归还记录，无法删除')
       return
     }
-    const { error } = await supabase.from('borrow_items').delete().eq('id', row.id)
+    const { error } = await supabase.from('borrow_items').delete().eq('id', itemRow.id)
     if (error) throw error
     ElMessage.success('删除成功')
     await loadItems()
-  } catch (err: any) {
-    ElMessage.error(err.message || '删除物品失败')
+  } catch (err: unknown) {
+    ElMessage.error(err instanceof Error && err.message ? err.message : '删除物品失败')
   }
 }
 
@@ -438,6 +521,9 @@ watch(filterClassId, async () => {
   await loadStudents()
   await loadItems()
 })
+
+// 说明：本页班级筛选（filterClassId）是页面自有状态，不再跟随顶栏班级下拉。
+// 借阅数据按 school_id 全校共享，顶栏切班对本页无影响；学生的可借范围也由本页下拉决定。
 
 onMounted(async () => {
   await loadSchoolClasses()
@@ -452,9 +538,9 @@ onMounted(async () => {
       <div class="toolbar">
         <div class="toolbar-left">
           <Goods class="header-icon" />
-          <span class="header-title">班级公共物品借阅</span>
+          <span class="header-title">公共物品借阅</span>
           <el-select
-            v-if="userStore.role === 'school_admin'"
+            v-if="schoolClasses.length > 0"
             v-model="filterClassId"
             clearable
             placeholder="按班级筛选"
@@ -462,19 +548,19 @@ onMounted(async () => {
           >
             <el-option label="全部班级" value="" />
             <el-option
-              v-for="c in schoolClasses"
-              :key="c.id"
-              :label="c.class_name"
-              :value="c.id"
+              v-for="classOption in schoolClasses"
+              :key="classOption.id"
+              :label="classOption.class_name"
+              :value="classOption.id"
             />
           </el-select>
-          <el-tag v-if="userStore.role === 'teacher' && userStore.className" type="info" style="margin-left: 12px">
-            {{ userStore.className }}
+          <el-tag type="info" style="margin-left: 12px">
+            {{ filterClassId ? (schoolClasses.find((c) => c.id === filterClassId)?.class_name || '') : '全校' }}
           </el-tag>
         </div>
         <div class="toolbar-right">
           <el-input
-            v-model="searchKey"
+            v-model="itemSearchKeyword"
             placeholder="搜索物品名称"
             :prefix-icon="Search"
             clearable
@@ -485,34 +571,34 @@ onMounted(async () => {
       </div>
     </template>
 
-    <el-table :data="filteredItems" v-loading="loading" stripe style="width: 100%">
+    <el-table :data="filteredItems" v-loading="itemsLoading" stripe style="width: 100%">
       <el-table-column prop="item_name" label="物品名称" min-width="140" />
       <el-table-column prop="type" label="类型" min-width="110" />
       <el-table-column prop="total_quantity" label="总数" width="90" />
       <el-table-column label="可用数量" width="100">
-        <template #default="{ row }">
-          <el-tag :type="row.available_quantity > 0 ? 'success' : 'danger'">
-            {{ row.available_quantity }}
+        <template #default="{ row: itemRow }">
+          <el-tag :type="itemRow.available_quantity > 0 ? 'success' : 'danger'">
+            {{ itemRow.available_quantity }}
           </el-tag>
         </template>
       </el-table-column>
       <el-table-column prop="location" label="存放位置" min-width="140">
-        <template #default="{ row }">{{ row.location || '-' }}</template>
+        <template #default="{ row: itemRow }">{{ itemRow.location || '-' }}</template>
       </el-table-column>
       <el-table-column label="最近借出人" min-width="140">
-        <template #default="{ row }">
-          <span v-if="recentBorrowerMap[row.id]">{{ recentBorrowerMap[row.id] }}</span>
+        <template #default="{ row: itemRow }">
+          <span v-if="recentBorrowerMap[itemRow.id]">{{ recentBorrowerMap[itemRow.id] }}</span>
           <span v-else style="color: #909399">暂无借出</span>
         </template>
       </el-table-column>
       <el-table-column label="操作" width="260" fixed="right">
-        <template #default="{ row }">
-          <el-button link type="primary" :disabled="(row as ItemRow).available_quantity <= 0" @click="openBorrowDialog(row as ItemRow)">
+        <template #default="{ row: itemRow }">
+          <el-button link type="primary" :disabled="(itemRow as ItemRow).available_quantity <= 0" @click="openBorrowDialog(itemRow as ItemRow)">
             借出
           </el-button>
-          <el-button link type="primary" @click="openRecordsDialog(row as ItemRow)">归还记录</el-button>
-          <el-button link type="warning" :icon="Edit" @click="openEditItemDialog(row as ItemRow)" />
-          <el-button link type="danger" :icon="Delete" @click="deleteItem(row as ItemRow)" />
+          <el-button link type="primary" @click="openRecordsDialog(itemRow as ItemRow)">归还记录</el-button>
+          <el-button link type="warning" :icon="Edit" @click="openEditItemDialog(itemRow as ItemRow)" />
+          <el-button link type="danger" :icon="Delete" @click="deleteItem(itemRow as ItemRow)" />
         </template>
       </el-table-column>
     </el-table>
@@ -526,7 +612,7 @@ onMounted(async () => {
           <el-input-number
             v-model="borrowForm.qty"
             :min="1"
-            :max="items.find(i => i.id === borrowForm.item_id)?.available_quantity || 1"
+            :max="borrowItemList.find((borrowItem) => borrowItem.id === borrowForm.item_id)?.available_quantity || 1"
             style="width: 100%"
           />
         </el-form-item>
@@ -538,10 +624,10 @@ onMounted(async () => {
             style="width: 100%"
           >
             <el-option
-              v-for="s in students"
-              :key="s.id"
-              :label="s.student_name"
-              :value="s.id"
+              v-for="studentOption in studentOptions"
+              :key="studentOption.id"
+              :label="studentOption.student_name"
+              :value="studentOption.id"
             />
           </el-select>
         </el-form-item>
@@ -568,35 +654,35 @@ onMounted(async () => {
     >
       <el-table :data="currentRecords" v-loading="recordsLoading" stripe size="small">
         <el-table-column label="状态" width="100">
-          <template #default="{ row }">
-            <el-tag v-if="row.status === 'borrowed'" type="danger">借出中</el-tag>
-            <el-tag v-else-if="row.status === 'returned'" type="success">已归还</el-tag>
+          <template #default="{ row: recordRow }">
+            <el-tag v-if="recordRow.status === 'borrowed'" type="danger">借出中</el-tag>
+            <el-tag v-else-if="recordRow.status === 'returned'" type="success">已归还</el-tag>
             <el-tag v-else type="warning">逾期</el-tag>
           </template>
         </el-table-column>
         <el-table-column label="学生" min-width="110">
-          <template #default="{ row }">{{ row.borrower_name }}</template>
+          <template #default="{ row: recordRow }">{{ recordRow.borrower_name }}</template>
         </el-table-column>
         <el-table-column prop="qty" label="数量" width="70" />
         <el-table-column label="借出时间" min-width="170">
-          <template #default="{ row }">{{ new Date(row.borrow_date).toLocaleString('zh-CN') }}</template>
+          <template #default="{ row: recordRow }">{{ new Date(recordRow.borrow_date).toLocaleString('zh-CN') }}</template>
         </el-table-column>
         <el-table-column label="归还时间" min-width="170">
-          <template #default="{ row }">
-            <span v-if="row.return_time">{{ new Date(row.return_time).toLocaleString('zh-CN') }}</span>
+          <template #default="{ row: recordRow }">
+            <span v-if="recordRow.return_time">{{ new Date(recordRow.return_time).toLocaleString('zh-CN') }}</span>
             <span v-else style="color: #909399">-</span>
           </template>
         </el-table-column>
         <el-table-column label="备注" min-width="120">
-          <template #default="{ row }">{{ row.remark || '-' }}</template>
+          <template #default="{ row: recordRow }">{{ recordRow.remark || '-' }}</template>
         </el-table-column>
         <el-table-column label="操作" width="110" fixed="right">
-          <template #default="{ row }">
+          <template #default="{ row: recordRow }">
             <el-button
-              v-if="row.status === 'borrowed'"
+              v-if="recordRow.status === 'borrowed'"
               link
               type="success"
-              @click="confirmReturn(row as RecordRow)"
+              @click="confirmReturn(recordRow as RecordRow)"
             >
               确认归还
             </el-button>
@@ -619,7 +705,21 @@ onMounted(async () => {
           <el-input v-model="itemForm.item_name" placeholder="如：足球、跳绳" />
         </el-form-item>
         <el-form-item label="物品类型">
-          <el-input v-model="itemForm.type" placeholder="如：体育器材、文具" />
+          <el-select
+            v-model="itemForm.type"
+            filterable
+            allow-create
+            default-first-option
+            placeholder="选择常用类型，或输入自定义类型"
+            style="width: 100%"
+          >
+            <el-option
+              v-for="itemOption in itemTypeOptions"
+              :key="itemOption.value"
+              :value="itemOption.value"
+              :label="itemOption.label"
+            />
+          </el-select>
         </el-form-item>
         <el-form-item label="总数" required>
           <el-input-number v-model="itemForm.total_quantity" :min="1" style="width: 100%" />

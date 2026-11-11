@@ -5,11 +5,16 @@
 #   chmod +x scripts/backup.sh
 #   ./scripts/backup.sh
 # 产物：deploy-backup-YYYYMMDD-HHMM.tar.gz
+#
+# 前置条件：容器 supabase-db 处于运行状态（数据库导出走 docker exec，
+#           不需要本机装 psql 客户端）
+# 注意：脚本整体带 set -e，所有 cp 后面都接了 `2>/dev/null || true`，
+#       让 deploy/、.env 这类可选文件缺失时不中断打包
 # ============================================================
 set -euo pipefail
 
-STAMP=$(date +%Y%m%d-%H%M)
-OUT_DIR="deploy-backup-${STAMP}"
+BACKUP_STAMP=$(date +%Y%m%d-%H%M)
+OUT_DIR="deploy-backup-${BACKUP_STAMP}"
 mkdir -p "${OUT_DIR}"
 
 echo "[1/3] 导出 PostgreSQL 数据（含 auth.users + 所有业务表）..."

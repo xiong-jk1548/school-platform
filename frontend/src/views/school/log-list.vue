@@ -28,20 +28,30 @@ const logs = ref<LogRow[]>([])
 const filterClassId = ref<string>('')
 const schoolClasses = ref<{ id: string; class_name: string }[]>([])
 
+/**
+ * 加载本校班级列表，用于「班级」筛选下拉。
+ * 仅学校管理员需要该筛选，其他角色直接跳过以省掉一次请求。
+ * @returns 无返回值，结果写入响应式变量 schoolClasses
+ */
 async function loadSchoolClasses() {
   if (userStore.role !== 'school_admin' || !userStore.schoolId) return
   try {
-    const { data, error } = await supabase
+    const { data: classData, error } = await supabase
       .from('classes')
       .select('id, class_name')
       .eq('school_id', userStore.schoolId)
     if (error) throw error
-    schoolClasses.value = (data ?? []) as { id: string; class_name: string }[]
-  } catch (err: any) {
-    ElMessage.error(err.message || '加载班级列表失败')
+    schoolClasses.value = (classData ?? []) as { id: string; class_name: string }[]
+  } catch (err: unknown) {
+    ElMessage.error(err instanceof Error && err.message ? err.message : '加载班级列表失败')
   }
 }
 
+/**
+ * 查询本校积分流水（最多 500 条），并把学生姓名、班级名、操作人姓名补全到每行记录上。
+ * 时间范围筛选按 created_at 生效；学生与操作人信息通过 id 批量反查后在前端拼装。
+ * @returns 无返回值，结果写入响应式变量 logs
+ */
 async function loadLogs() {
   if (!userStore.schoolId) return
   loading.value = true
@@ -55,16 +65,16 @@ async function loadLogs() {
       const [start, end] = dateRange.value
       query = query.gte('created_at', start).lte('created_at', end)
     }
-    const { data, error } = await query.limit(500)
+    const { data: logData, error } = await query.limit(500)
     if (error) throw error
-    const rows = (data ?? []) as LogRow[]
+    const logRows = (logData ?? []) as LogRow[]
 
-    const studentIds = Array.from(new Set(rows.map((r) => r.student_id).filter(Boolean)))
+    const studentIds = Array.from(new Set(logRows.map((log) => log.student_id).filter(Boolean)))
     const operatorIds = Array.from(
-      new Set(rows.map((r) => r.operate_user_id).filter(Boolean) as string[]),
+      new Set(logRows.map((log) => log.operate_user_id).filter(Boolean) as string[]),
     )
 
-    const [stuRes, opRes] = await Promise.all([
+    const [studentRes, operatorRes] = await Promise.all([
       studentIds.length > 0
         ? supabase.from('students').select('id, name, class_id').in('id', studentIds)
         : Promise.resolve({ data: [], error: null }),
@@ -76,58 +86,67 @@ async function loadLogs() {
     let classesMap: Record<string, string> = {}
     if (studentIds.length > 0) {
       const classIds = Array.from(
-        new Set(((stuRes.data as any[]) ?? []).map((s) => s.class_id).filter(Boolean)),
+        new Set(((studentRes.data as any[]) ?? []).map((student) => student.class_id).filter(Boolean)),
       )
       if (classIds.length > 0) {
-        const { data: classRes } = await supabase
+        const { data: classRows } = await supabase
           .from('classes')
           .select('id, name')
           .in('id', classIds)
-        classesMap = Object.fromEntries(((classRes as any[]) ?? []).map((c) => [c.id, c.name]))
+        classesMap = Object.fromEntries(((classRows as any[]) ?? []).map((cls) => [cls.id, cls.name]))
       }
     }
 
-    const stuMap = Object.fromEntries(
-      (((stuRes as any).data as any[]) ?? []).map((s: any) => [s.id, s]),
+    const studentMap = Object.fromEntries(
+      (((studentRes as any).data as any[]) ?? []).map((student: any) => [student.id, student]),
     )
-    const opMap = Object.fromEntries(
-      (((opRes as any).data as any[]) ?? []).map((p: any) => [p.id, p]),
+    const operatorMap = Object.fromEntries(
+      (((operatorRes as any).data as any[]) ?? []).map((profile: any) => [profile.id, profile]),
     )
 
-    for (const r of rows) {
-      const stu = stuMap[r.student_id]
-      r.student_name = stu?.name ?? '-'
-      r.class_id = stu?.class_id
-      r.class_name = stu?.class_id ? classesMap[stu.class_id] ?? '-' : '-'
-      r.operate_user_name = r.operate_user_id ? opMap[r.operate_user_id]?.real_name ?? '-' : '-'
+    for (const log of logRows) {
+      const student = studentMap[log.student_id]
+      log.student_name = student?.name ?? '-'
+      log.class_id = student?.class_id
+      log.class_name = student?.class_id ? classesMap[student.class_id] ?? '-' : '-'
+      log.operate_user_name = log.operate_user_id ? operatorMap[log.operate_user_id]?.real_name ?? '-' : '-'
     }
-    logs.value = rows
-  } catch (err: any) {
-    ElMessage.error(err.message || '加载积分流水失败')
+    logs.value = logRows
+  } catch (err: unknown) {
+    ElMessage.error(err instanceof Error && err.message ? err.message : '加载积分流水失败')
   } finally {
     loading.value = false
   }
 }
 
+/** 表格导出用的行数据：把积分流水映射为中文表头的二维数据 */
 const exportRows = computed(() =>
-  filteredLogs.value.map((r) => ({
-    学生: r.student_name ?? '',
-    班级: r.class_name ?? '',
-    变动值: r.score ?? 0,
-    备注: r.remark ?? '',
-    操作人: r.operate_user_name ?? '',
-    时间: r.created_at ?? '',
+  filteredLogs.value.map((log) => ({
+    学生: log.student_name ?? '',
+    班级: log.class_name ?? '',
+    变动值: log.score ?? 0,
+    备注: log.remark ?? '',
+    操作人: log.operate_user_name ?? '',
+    时间: log.created_at ?? '',
   })),
 )
 
+/**
+ * 按「班级」下拉筛选流水列表；非学校管理员不做班级过滤。
+ * @returns 过滤后的积分流水数组
+ */
 const filteredLogs = computed(() => {
-  let list = logs.value
+  let resultLogs = logs.value
   if (userStore.role === 'school_admin' && filterClassId.value) {
-    list = list.filter((r) => r.class_id === filterClassId.value)
+    resultLogs = resultLogs.filter((log) => log.class_id === filterClassId.value)
   }
-  return list
+  return resultLogs
 })
 
+/**
+ * 导出当前筛选结果为 Excel；无数据时给出提示。
+ * @returns 无返回值，触发浏览器下载
+ */
 function handleExport() {
   if (exportRows.value.length === 0) {
     ElMessage.warning('暂无可导出的数据')
@@ -172,10 +191,10 @@ onMounted(async () => {
         >
           <el-option label="全部班级" value="" />
           <el-option
-            v-for="c in schoolClasses"
-            :key="c.id"
-            :label="c.class_name"
-            :value="c.id"
+            v-for="classItem in schoolClasses"
+            :key="classItem.id"
+            :label="classItem.class_name"
+            :value="classItem.id"
           />
         </el-select>
       </el-form-item>

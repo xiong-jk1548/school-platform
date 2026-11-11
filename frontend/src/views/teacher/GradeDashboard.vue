@@ -36,55 +36,62 @@ const currentExam = ref('')
 const subjectOptions = ref<string[]>([])
 const currentSubject = ref('')
 
+/**
+ * 加载本班所有成绩记录，补齐学生姓名，并初始化考试/学科下拉数据源
+ * @returns 无返回值（副作用：写入 scores、examOptions、subjectOptions，并维护 loading）
+ */
 async function loadData() {
   if (!userStore.classId) return
   loading.value = true
   try {
-    const { data, error } = await supabase
+    const { data: scoreRows, error } = await supabase
       .from('student_scores')
       .select('*')
       .order('exam_date', { ascending: false })
     if (error) throw error
-    const rows = (data ?? []) as ScoreRow[]
+    const scoreList = (scoreRows ?? []) as ScoreRow[]
 
     // 补齐 student_name
-    const studentIds = Array.from(new Set(rows.map((r) => r.student_id)))
+    const studentIds = Array.from(new Set(scoreList.map((score) => score.student_id)))
     if (studentIds.length > 0) {
-      const { data: stuRes } = await supabase
+      const { data: studentRows } = await supabase
         .from('students')
         .select('id, student_name')
         .in('id', studentIds)
       const stuMap: Record<string, string> = {}
-      ;((stuRes ?? []) as any[]).forEach((s) => { stuMap[s.id] = s.student_name })
-      rows.forEach((r) => { if (!r.student_name) r.student_name = stuMap[r.student_id] })
+      ;((studentRows ?? []) as any[]).forEach((student) => { stuMap[student.id] = student.student_name })
+      scoreList.forEach((score) => { if (!score.student_name) score.student_name = stuMap[score.student_id] })
     }
-    scores.value = rows
+    scores.value = scoreList
 
     // 考试列表
-    const exams = Array.from(new Set(rows.map((r) => r.exam_name))).sort()
-    examOptions.value = exams
-    if (!currentExam.value && exams.length > 0) currentExam.value = exams[exams.length - 1]
+    const examNames = Array.from(new Set(scoreList.map((score) => score.exam_name))).sort()
+    examOptions.value = examNames
+    if (!currentExam.value && examNames.length > 0) currentExam.value = examNames[examNames.length - 1]
 
     // 学科列表（取当前考试的学科）
     updateSubjectOptions()
-  } catch (err: any) {
-    ElMessage.error(err.message || '加载成绩数据失败')
+  } catch (err: unknown) {
+    ElMessage.error(err instanceof Error && err.message ? err.message : '加载成绩数据失败')
   } finally {
     loading.value = false
   }
 }
 
+/**
+ * 按当前选中的考试刷新学科下拉；当前学科为空时默认选中第一个学科
+ */
 function updateSubjectOptions() {
   if (!currentExam.value) {
     subjectOptions.value = []
     currentSubject.value = ''
     return
   }
-  const list = Array.from(
-    new Set(scores.value.filter((r) => r.exam_name === currentExam.value).map((r) => r.subject)),
+  const subjectList = Array.from(
+    new Set(scores.value.filter((score) => score.exam_name === currentExam.value).map((score) => score.subject)),
   ).sort()
-  subjectOptions.value = list
-  if (!currentSubject.value && list.length > 0) currentSubject.value = list[0]
+  subjectOptions.value = subjectList
+  if (!currentSubject.value && subjectList.length > 0) currentSubject.value = subjectList[0]
 }
 
 // 当考试变化时，更新学科选项
@@ -93,59 +100,59 @@ watch(currentExam, updateSubjectOptions)
 
 // ===== KPI 计算 =====
 const examScores = computed(() =>
-  scores.value.filter((r) => r.exam_name === currentExam.value),
+  scores.value.filter((score) => score.exam_name === currentExam.value),
 )
 
 const classAvg = computed(() => {
   if (examScores.value.length === 0) return 0
-  const total = examScores.value.reduce((s, r) => s + r.score, 0)
-  return +(total / examScores.value.length).toFixed(1)
+  const totalScore = examScores.value.reduce((sum, score) => sum + score.score, 0)
+  return +(totalScore / examScores.value.length).toFixed(1)
 })
 
 const passRate = computed(() => {
   if (examScores.value.length === 0) return 0
-  const passed = examScores.value.filter((r) => r.score / r.full_score >= toPct(passLineVal.value, r.full_score)).length
+  const passed = examScores.value.filter((score) => score.score / score.full_score >= toPct(passLineVal.value, score.full_score)).length
   return +((passed / examScores.value.length) * 100).toFixed(1)
 })
 
 const excellentRate = computed(() => {
   if (examScores.value.length === 0) return 0
-  const excellent = examScores.value.filter((r) => r.score / r.full_score >= toPct(excellentLineVal.value, r.full_score)).length
+  const excellent = examScores.value.filter((score) => score.score / score.full_score >= toPct(excellentLineVal.value, score.full_score)).length
   return +((excellent / examScores.value.length) * 100).toFixed(1)
 })
 
 const studentCount = computed(() => {
   if (!currentSubject.value) return 0
-  return examScores.value.filter((r) => r.subject === currentSubject.value).length
+  return examScores.value.filter((score) => score.subject === currentSubject.value).length
 })
 
 // ===== 学科平均分柱状图数据 =====
 const subjectAvgs = computed(() => {
-  const map: Record<string, { sum: number; count: number }> = {}
-  examScores.value.forEach((r) => {
-    if (!map[r.subject]) map[r.subject] = { sum: 0, count: 0 }
-    map[r.subject].sum += r.score
-    map[r.subject].count += 1
+  const statsBySubject: Record<string, { sum: number; count: number }> = {}
+  examScores.value.forEach((score) => {
+    if (!statsBySubject[score.subject]) statsBySubject[score.subject] = { sum: 0, count: 0 }
+    statsBySubject[score.subject].sum += score.score
+    statsBySubject[score.subject].count += 1
   })
-  const result = Object.entries(map).map(([subject, { sum, count }]) => ({
+  const subjectAvgRows = Object.entries(statsBySubject).map(([subject, { sum, count }]) => ({
     subject,
     avg: +(sum / count).toFixed(1),
   }))
   // 找最大值用于柱状图归一化
-  const max = Math.max(...result.map((r) => r.avg), 1)
-  return result.map((r) => ({ ...r, pct: (r.avg / max) * 100 }))
+  const maxAvg = Math.max(...subjectAvgRows.map((avgRow) => avgRow.avg), 1)
+  return subjectAvgRows.map((avgRow) => ({ ...avgRow, pct: (avgRow.avg / maxAvg) * 100 }))
 })
 
 // ===== 成绩分布（环形图数据）=====
 const gradeDistribution = computed(() => {
   if (!currentSubject.value) return []
-  const rows = examScores.value.filter((r) => r.subject === currentSubject.value)
-  if (rows.length === 0) return []
-  const total = rows.length
-  const excellent = rows.filter((r) => r.score / r.full_score >= toPct(excellentLineVal.value, r.full_score)).length
-  const good = rows.filter((r) => r.score / r.full_score >= GOOD_LINE && r.score / r.full_score < toPct(excellentLineVal.value, r.full_score)).length
-  const pass = rows.filter((r) => r.score / r.full_score >= toPct(passLineVal.value, r.full_score) && r.score / r.full_score < GOOD_LINE).length
-  const fail = rows.filter((r) => r.score / r.full_score < toPct(passLineVal.value, r.full_score)).length
+  const subjectScores = examScores.value.filter((score) => score.subject === currentSubject.value)
+  if (subjectScores.length === 0) return []
+  const total = subjectScores.length
+  const excellent = subjectScores.filter((score) => score.score / score.full_score >= toPct(excellentLineVal.value, score.full_score)).length
+  const good = subjectScores.filter((score) => score.score / score.full_score >= GOOD_LINE && score.score / score.full_score < toPct(excellentLineVal.value, score.full_score)).length
+  const pass = subjectScores.filter((score) => score.score / score.full_score >= toPct(passLineVal.value, score.full_score) && score.score / score.full_score < GOOD_LINE).length
+  const fail = subjectScores.filter((score) => score.score / score.full_score < toPct(passLineVal.value, score.full_score)).length
   const exL = Math.round(toPct(excellentLineVal.value, 100) * 100)
   const psL = Math.round(toPct(passLineVal.value, 100) * 100)
   const gdL = Math.round(GOOD_LINE * 100)
@@ -160,29 +167,29 @@ const gradeDistribution = computed(() => {
 // ===== 趋势折线（同一学科，不同考试）=====
 const trendData = computed(() => {
   if (!currentSubject.value) return []
-  const map: Record<string, { sum: number; count: number }> = {}
+  const statsByExam: Record<string, { sum: number; count: number }> = {}
   scores.value
-    .filter((r) => r.subject === currentSubject.value)
-    .forEach((r) => {
-      if (!map[r.exam_name]) map[r.exam_name] = { sum: 0, count: 0 }
-      map[r.exam_name].sum += r.score
-      map[r.exam_name].count += 1
+    .filter((score) => score.subject === currentSubject.value)
+    .forEach((score) => {
+      if (!statsByExam[score.exam_name]) statsByExam[score.exam_name] = { sum: 0, count: 0 }
+      statsByExam[score.exam_name].sum += score.score
+      statsByExam[score.exam_name].count += 1
     })
-  return Object.entries(map)
+  return Object.entries(statsByExam)
     .map(([exam_name, { sum, count }]) => ({ exam_name, avg: +(sum / count).toFixed(1) }))
-    .sort((a, b) => {
+    .sort((examA, examB) => {
       // 按考试日期排序（从原 scores 里找）
-      const ra = scores.value.find((r) => r.exam_name === a.exam_name && r.subject === currentSubject.value)
-      const rb = scores.value.find((r) => r.exam_name === b.exam_name && r.subject === currentSubject.value)
-      return (ra?.exam_date || '').localeCompare(rb?.exam_date || '')
+      const scoreOfA = scores.value.find((score) => score.exam_name === examA.exam_name && score.subject === currentSubject.value)
+      const scoreOfB = scores.value.find((score) => score.exam_name === examB.exam_name && score.subject === currentSubject.value)
+      return (scoreOfA?.exam_date || '').localeCompare(scoreOfB?.exam_date || '')
     })
 })
 
 // ===== 需关注学生 =====
 const needAttention = computed(() => {
   if (!currentSubject.value) return []
-  const rows = examScores.value.filter((r) => r.subject === currentSubject.value && r.score / r.full_score < toPct(passLineVal.value, r.full_score))
-  return rows.sort((a, b) => a.score - b.score).slice(0, 5)
+  const failingScores = examScores.value.filter((score) => score.subject === currentSubject.value && score.score / score.full_score < toPct(passLineVal.value, score.full_score))
+  return failingScores.sort((scoreA, scoreB) => scoreA.score - scoreB.score).slice(0, 5)
 })
 
 onMounted(loadData)
@@ -198,11 +205,11 @@ onMounted(loadData)
       <div class="toolbar-right">
         <span class="switch-label">考试：</span>
         <el-radio-group v-model="currentExam" size="default" @change="updateSubjectOptions">
-          <el-radio-button v-for="e in examOptions" :key="e" :label="e">{{ e }}</el-radio-button>
+          <el-radio-button v-for="exam in examOptions" :key="exam" :label="exam">{{ exam }}</el-radio-button>
         </el-radio-group>
         <span class="switch-label" style="margin-left: 16px">学科：</span>
         <el-radio-group v-model="currentSubject" size="default">
-          <el-radio-button v-for="s in subjectOptions" :key="s" :label="s">{{ s }}</el-radio-button>
+          <el-radio-button v-for="subject in subjectOptions" :key="subject" :label="subject">{{ subject }}</el-radio-button>
         </el-radio-group>
       </div>
     </div>
@@ -259,14 +266,14 @@ onMounted(loadData)
             <div class="dashboard-card-title">各学科平均分对比</div>
             <div class="bar-chart">
               <div
-                v-for="item in subjectAvgs"
-                :key="item.subject"
+                v-for="subjectAvg in subjectAvgs"
+                :key="subjectAvg.subject"
                 class="bar-item"
               >
-                <div class="bar-label">{{ item.subject }}</div>
+                <div class="bar-label">{{ subjectAvg.subject }}</div>
                 <div class="bar-track">
-                  <div class="bar-fill" :style="{ width: item.pct + '%' }">
-                    <span class="bar-value">{{ item.avg }}</span>
+                  <div class="bar-fill" :style="{ width: subjectAvg.pct + '%' }">
+                    <span class="bar-value">{{ subjectAvg.avg }}</span>
                   </div>
                 </div>
               </div>
@@ -279,8 +286,8 @@ onMounted(loadData)
             <div class="grade-dist" v-if="gradeDistribution.length > 0">
               <!-- 环形图（纯 CSS conic-gradient） -->
               <div class="ring-chart" :style="{
-                background: `conic-gradient(${gradeDistribution.map((g, i) =>
-                  `${g.color} ${gradeDistribution.slice(0, i).reduce((s, x) => s + x.pct, 0)}% ${gradeDistribution.slice(0, i + 1).reduce((s, x) => s + x.pct, 0)}%`,
+                background: `conic-gradient(${gradeDistribution.map((grade, gradeIdx) =>
+                  `${grade.color} ${gradeDistribution.slice(0, gradeIdx).reduce((sumPct, prevGrade) => sumPct + prevGrade.pct, 0)}% ${gradeDistribution.slice(0, gradeIdx + 1).reduce((sumPct, prevGrade) => sumPct + prevGrade.pct, 0)}%`,
                 ).join(', ')})`,
               }">
                 <div class="ring-inner">
@@ -290,10 +297,10 @@ onMounted(loadData)
               </div>
               <!-- 图例 -->
               <div class="ring-legend">
-                <div v-for="g in gradeDistribution" :key="g.label" class="legend-item">
-                  <span class="legend-dot" :style="{ background: g.color }"></span>
-                  <span class="legend-label">{{ g.label }}</span>
-                  <span class="legend-value">{{ g.value }} 人 · {{ g.pct }}%</span>
+                <div v-for="grade in gradeDistribution" :key="grade.label" class="legend-item">
+                  <span class="legend-dot" :style="{ background: grade.color }"></span>
+                  <span class="legend-label">{{ grade.label }}</span>
+                  <span class="legend-value">{{ grade.value }} 人 · {{ grade.pct }}%</span>
                 </div>
               </div>
             </div>
@@ -310,13 +317,13 @@ onMounted(loadData)
             </div>
             <div class="trend-chart" v-if="trendData.length >= 2">
               <div class="trend-grid">
-                <div v-for="i in 5" :key="i" class="grid-line"></div>
+                <div v-for="gridLineNo in 5" :key="gridLineNo" class="grid-line"></div>
               </div>
               <svg class="trend-line" viewBox="0 0 400 150" preserveAspectRatio="none">
                 <polyline
-                  :points="trendData.map((d, i) => {
-                    const x = (i / (trendData.length - 1)) * 400
-                    const y = 150 - (d.avg / 100) * 150
+                  :points="trendData.map((point, pointIdx) => {
+                    const x = (pointIdx / (trendData.length - 1)) * 400
+                    const y = 150 - (point.avg / 100) * 150
                     return `${x},${y}`
                   }).join(' ')"
                   fill="none"
@@ -326,10 +333,10 @@ onMounted(loadData)
                   stroke-linejoin="round"
                 />
                 <circle
-                  v-for="(d, i) in trendData"
-                  :key="i"
-                  :cx="(i / (trendData.length - 1)) * 400"
-                  :cy="150 - (d.avg / 100) * 150"
+                  v-for="(point, pointIdx) in trendData"
+                  :key="pointIdx"
+                  :cx="(pointIdx / (trendData.length - 1)) * 400"
+                  :cy="150 - (point.avg / 100) * 150"
                   r="6"
                   fill="#2B5CE6"
                   stroke="#fff"
@@ -337,10 +344,10 @@ onMounted(loadData)
                 />
               </svg>
               <div class="trend-x-labels">
-                <span v-for="d in trendData" :key="d.exam_name">{{ d.exam_name }}</span>
+                <span v-for="point in trendData" :key="point.exam_name">{{ point.exam_name }}</span>
               </div>
               <div class="trend-y-values">
-                <span v-for="(d, i) in trendData" :key="i" class="y-val" :style="{ left: (i / (trendData.length - 1)) * 100 + '%' }">{{ d.avg }}</span>
+                <span v-for="(point, pointIdx) in trendData" :key="pointIdx" class="y-val" :style="{ left: (pointIdx / (trendData.length - 1)) * 100 + '%' }">{{ point.avg }}</span>
               </div>
             </div>
             <div v-else class="empty-mini">至少需要 2 次考试成绩才能显示趋势</div>
@@ -352,13 +359,13 @@ onMounted(loadData)
               需关注学生（{{ currentSubject || '-' }}）
             </div>
             <div v-if="needAttention.length > 0" class="attention-list">
-              <div v-for="row in needAttention" :key="row.id" class="attention-item">
+              <div v-for="failingScore in needAttention" :key="failingScore.id" class="attention-item">
                 <div class="attention-avatar">
-                  {{ (row.student_name || '?').charAt(0) }}
+                  {{ (failingScore.student_name || '?').charAt(0) }}
                 </div>
                 <div class="attention-info">
-                  <div class="attention-name">{{ row.student_name }}</div>
-                  <div class="attention-sub">分数 {{ row.score }} / {{ row.full_score }}（{{ ((row.score / row.full_score) * 100).toFixed(1) }}%）</div>
+                  <div class="attention-name">{{ failingScore.student_name }}</div>
+                  <div class="attention-sub">分数 {{ failingScore.score }} / {{ failingScore.full_score }}（{{ ((failingScore.score / failingScore.full_score) * 100).toFixed(1) }}%）</div>
                 </div>
                 <el-tag type="danger" effect="plain" size="small">不及格</el-tag>
               </div>

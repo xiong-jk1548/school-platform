@@ -1,10 +1,14 @@
 #!/bin/bash
 # ============================================================
-# 一键恢复：新项目里把 .tar.gz 解开后跑
+# 一键恢复：把 scripts/backup.sh 产出的 .tar.gz 解开后，在本目录执行
+#
 # 用法：
 #   tar -xzf deploy-backup-XXXXXX.tar.gz
 #   cd deploy-backup-XXXXXX
 #   ./restore.sh
+#
+# 前置条件：本目录下需要有 docker-compose.yml、.env，以及（可选）database.sql
+# 副作用：database.sql 带 --clean --if-exists，导入时会先 DROP 再重建，覆盖现有数据
 # ============================================================
 set -euo pipefail
 
@@ -14,9 +18,9 @@ echo "=============================================="
 # 先起 db / rest / auth / kong（不包含 web —— 前端可能要重新 build）
 docker compose up -d db rest auth kong
 
-# 等 db 就绪
+# 等 db 就绪：最多轮询 30 次，每次间隔 2 秒
 echo "等待数据库就绪..."
-for i in $(seq 1 30); do
+for attempt in $(seq 1 30); do
   if docker exec supabase-db pg_isready -U supabase -d postgres 2>/dev/null | grep -q "accepting connections"; then
     echo "✔ DB ready"
     break

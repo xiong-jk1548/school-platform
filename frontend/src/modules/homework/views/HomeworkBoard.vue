@@ -41,31 +41,60 @@ const selectedDate = ref<string>(formatDate(new Date()))
 const searchKeyword = ref('')
 const filterSubjectId = ref<string>('')
 const showIncompleteOnly = ref(false)
-const loading = ref(false)
-const subjects = ref<SubjectRow[]>([])
-const allStudents = ref<StudentRow[]>([])
-const records = ref<Map<string, RecordRow>>(new Map())
-const notes = ref<NoteRow[]>([])  // 今日作业备注
+const boardLoading = ref(false)
+const subjectList = ref<SubjectRow[]>([])
+const allStudentList = ref<StudentRow[]>([])
+const recordMap = ref<Map<string, RecordRow>>(new Map())
+const noteList = ref<NoteRow[]>([])  // 今日作业备注
+// 快速录入条的本地草稿（键 = 科目 ID）。
+// 输入必须先落在本地变量上：el-input 在每次输入后会按 props.modelValue 回写原生输入框，
+// 若直接绑 noteList（只读派生值），敲一个字就会被回写成旧值，表现为"备注框打不进字"。
+const noteDraft = ref<Record<string, string>>({})
+
+/**
+ * 用「科目列表 + 已保存备注」重建本地草稿。
+ * 科目未布置作业时补空串，保证每个科目都有键，v-model 不会落到 undefined。
+ * @returns 无返回值（副作用：写入 noteDraft）
+ */
+function syncNoteDraft() {
+  const draft: Record<string, string> = {}
+  for (const subjectRow of subjectList.value) draft[subjectRow.id] = ''
+  for (const noteItem of noteList.value) draft[noteItem.subject_id] = noteItem.content
+  noteDraft.value = draft
+}
 
 const filterClassId = ref<string>('')
 const schoolClasses = ref<{ id: string; class_name: string }[]>([])
 
+/**
+ * 当前操作的班级。
+ * 作业是**校内公开**的数据（RLS 已按 school_id 放行），教师可以跨班查看/登记，
+ * 因此教师也走下拉选择，未选时回落到自己绑定的班。
+ */
 const effectiveClassId = computed<string | null>(() => {
   if (userStore.role === 'school_admin') return filterClassId.value || null
-  return userStore.classId || null
+  return filterClassId.value || userStore.boundClassId || null
 })
 
+/**
+ * 加载班级下拉数据：本校全部班级（教师可跨班协作，故与学校管理员一致）。
+ * 教师默认选中自己的班，学校管理员默认"全部"。
+ * @returns 无返回值（副作用：写入 schoolClasses 与 filterClassId）
+ */
 async function loadSchoolClasses() {
-  if (userStore.role !== 'school_admin' || !userStore.schoolId) return
+  if (!userStore.schoolId) return
   try {
-    const { data, error } = await supabase
+    const { data: classRows, error } = await supabase
       .from('classes')
       .select('id, class_name')
       .eq('school_id', userStore.schoolId)
     if (error) throw error
-    schoolClasses.value = (data ?? []) as { id: string; class_name: string }[]
-  } catch (err: any) {
-    ElMessage.error(err.message || '加载班级列表失败')
+    schoolClasses.value = (classRows ?? []) as { id: string; class_name: string }[]
+    if (userStore.role !== 'school_admin' && !filterClassId.value) {
+      filterClassId.value = userStore.boundClassId || ''
+    }
+  } catch (err: unknown) {
+    ElMessage.error(err instanceof Error && err.message ? err.message : '加载班级列表失败')
   }
 }
 
@@ -73,109 +102,144 @@ async function loadSchoolClasses() {
 const editingSubjectId = ref<string | null>(null)
 const editingContent = ref('')
 
-// 学科配色（柔和渐变底）
-function subjectColor(id: string): string {
-  const sub = subjects.value.find((s) => s.id === id)
-  if (!sub) return '#2B5CE6'
+/**
+ * 依据科目名称生成一个稳定的展示配色，同一科目每次渲染颜色一致。
+ * @param subjectId 科目 ID
+ * @returns 十六进制颜色值；科目不存在时返回默认主色
+ */
+function subjectColor(subjectId: string): string {
+  const subjectRow = subjectList.value.find((subjectItem) => subjectItem.id === subjectId)
+  if (!subjectRow) return '#2B5CE6'
   // 给每个学科按其名字生成稳定颜色
   const palette = ['#2B5CE6', '#10B981', '#F59E0B', '#EF4444', '#8B5CF6', '#06B6D4', '#EC4899']
-  let h = 0
-  for (let i = 0; i < sub.subject_name.length; i++) h += sub.subject_name.charCodeAt(i)
-  return palette[h % palette.length]
+  let nameCharSum = 0
+  for (let charIndex = 0; charIndex < subjectRow.subject_name.length; charIndex++) nameCharSum += subjectRow.subject_name.charCodeAt(charIndex)
+  return palette[nameCharSum % palette.length]
 }
 
-function startEditCard(sub: SubjectRow) {
-  editingSubjectId.value = sub.id
-  editingContent.value = notes.value.find((n) => n.subject_id === sub.id)?.content || ''
+/**
+ * 进入某个科目的作业卡片编辑态，并把已保存的备注内容回填到输入框。
+ * @param subjectRow 被编辑的科目行
+ * @returns 无返回值（副作用：写入 editingSubjectId 与 editingContent）
+ */
+function startEditCard(subjectRow: SubjectRow) {
+  editingSubjectId.value = subjectRow.id
+  editingContent.value = noteList.value.find((noteItem) => noteItem.subject_id === subjectRow.id)?.content || ''
 }
+/** 取消卡片编辑态并清空草稿内容 */
 function cancelEditCard() {
   editingSubjectId.value = null
   editingContent.value = ''
 }
+/** 保存卡片编辑内容（空内容等价于删除备注），随后退出编辑态 */
 async function confirmEditCard() {
   if (!editingSubjectId.value) return
   await saveNoteContent(editingSubjectId.value, editingContent.value)
   cancelEditCard()
 }
+/**
+ * 删除某个科目的作业备注。
+ * @param subjectId 科目 ID
+ * @returns 无返回值
+ */
 async function deleteCardNote(subjectId: string) {
   await saveNoteContent(subjectId, '')
 }
 
 const subjectDialogVisible = ref(false)
 
-function formatDate(d: Date): string {
-  const y = d.getFullYear()
-  const m = String(d.getMonth() + 1).padStart(2, '0')
-  const day = String(d.getDate()).padStart(2, '0')
-  return `${y}-${m}-${day}`
+/**
+ * 将日期对象格式化为 YYYY-MM-DD 字符串，作为作业记录的 record_date。
+ * @param date 待格式化的日期
+ * @returns 形如 2026-09-16 的日期字符串
+ */
+function formatDate(date: Date): string {
+  const year = date.getFullYear()
+  const month = String(date.getMonth() + 1).padStart(2, '0')
+  const dayOfMonth = String(date.getDate()).padStart(2, '0')
+  return `${year}-${month}-${dayOfMonth}`
 }
 
+/**
+ * 生成「学生 + 科目」单元格的唯一键，用于作业记录 Map 的读写。
+ * @param studentId 学生 ID
+ * @param subjectId 科目 ID
+ * @returns 由学生 ID 与科目 ID 拼接而成的键
+ */
 function recordKey(studentId: string, subjectId: string): string {
   return `${studentId}__${subjectId}`
 }
 
 const filteredStudents = computed(() => {
-  let list = allStudents.value
-  const kw = searchKeyword.value.trim()
-  if (kw) {
-    list = list.filter(
-      (s) => (s.student_name || s.name || '').includes(kw),
+  let studentRows = allStudentList.value
+  const keyword = searchKeyword.value.trim()
+  if (keyword) {
+    studentRows = studentRows.filter(
+      (studentRow) => (studentRow.student_name || studentRow.name || '').includes(keyword),
     )
   }
   if (showIncompleteOnly.value) {
     // 只保留：在当前筛选学科中存在未完成记录的学生
-    list = list.filter((s) => {
+    studentRows = studentRows.filter((studentRow) => {
       const targetSubjects = filterSubjectId.value
-        ? subjects.value.filter((sub) => sub.id === filterSubjectId.value)
-        : subjects.value
-      return targetSubjects.some((sub) => {
-        const rec = records.value.get(recordKey(s.id, sub.id))
-        return !rec || !rec.is_done
+        ? subjectList.value.filter((subjectRow) => subjectRow.id === filterSubjectId.value)
+        : subjectList.value
+      return targetSubjects.some((subjectRow) => {
+        const homeworkRecord = recordMap.value.get(recordKey(studentRow.id, subjectRow.id))
+        return !homeworkRecord || !homeworkRecord.is_done
       })
     })
   }
-  return list
+  return studentRows
 })
 
 const filteredSubjects = computed(() => {
-  if (!filterSubjectId.value) return subjects.value
-  return subjects.value.filter((s) => s.id === filterSubjectId.value)
+  if (!filterSubjectId.value) return subjectList.value
+  return subjectList.value.filter((subjectRow) => subjectRow.id === filterSubjectId.value)
 })
 
 const totalCells = computed(() => filteredStudents.value.length * filteredSubjects.value.length)
 const doneCells = computed(() => {
-  let n = 0
-  filteredStudents.value.forEach((s) => {
-    filteredSubjects.value.forEach((sub) => {
-      const rec = records.value.get(recordKey(s.id, sub.id))
-      if (rec && rec.is_done) n++
+  let doneCount = 0
+  filteredStudents.value.forEach((studentRow) => {
+    filteredSubjects.value.forEach((subjectRow) => {
+      const homeworkRecord = recordMap.value.get(recordKey(studentRow.id, subjectRow.id))
+      if (homeworkRecord && homeworkRecord.is_done) doneCount++
     })
   })
-  return n
+  return doneCount
 })
 const completionRate = computed(() => {
   if (totalCells.value === 0) return 0
   return Math.round((doneCells.value / totalCells.value) * 100)
 })
 
+/**
+ * 加载本校配置的作业科目（按 sort_order 升序）。
+ * @returns 无返回值（副作用：写入 subjectList）
+ */
 async function loadSubjects() {
   if (!userStore.schoolId) return
   try {
-    const { data, error } = await supabase
+    const { data: subjectRows, error } = await supabase
       .from('homework_subjects')
       .select('id, subject_name, sort_order')
       .eq('school_id', userStore.schoolId)
       .order('sort_order', { ascending: true })
     if (error) throw error
-    subjects.value = (data ?? []) as SubjectRow[]
-  } catch (err: any) {
-    ElMessage.error(err.message || '加载科目列表失败')
+    subjectList.value = (subjectRows ?? []) as SubjectRow[]
+  } catch (err: unknown) {
+    ElMessage.error(err instanceof Error && err.message ? err.message : '加载科目列表失败')
   }
 }
 
+/**
+ * 加载作业看板需要的学生列表。
+ * 学校管理员按所选班级（未选则按学校）取数；教师固定取自己任教的班级。
+ * @returns 无返回值（副作用：写入 allStudentList）
+ */
 async function loadStudents() {
-  if (userStore.role !== 'school_admin' && !userStore.classId) return
-  if (userStore.role === 'school_admin' && !userStore.schoolId) return
+  if (!userStore.schoolId) return
   try {
     let query = supabase
       .from('students')
@@ -188,50 +252,63 @@ async function loadStudents() {
         query = query.eq('school_id', userStore.schoolId)
       }
     } else {
-      query = query.eq('class_id', userStore.classId)
+      // 教师：按当前操作班级取学生（可切到本校任意班）
+      if (!effectiveClassId.value) return
+      query = query.eq('class_id', effectiveClassId.value)
     }
-    const { data, error } = await query
+    const { data: studentRows, error } = await query
     if (error) throw error
-    allStudents.value = (data ?? []) as StudentRow[]
-  } catch (err: any) {
-    ElMessage.error(err.message || '加载学生列表失败')
+    allStudentList.value = (studentRows ?? []) as StudentRow[]
+  } catch (err: unknown) {
+    ElMessage.error(err instanceof Error && err.message ? err.message : '加载学生列表失败')
   }
 }
 
+/**
+ * 加载所选日期下、当前学生范围内的作业完成记录，并整理为「学生+科目」索引的 Map。
+ * @returns 无返回值（副作用：写入 recordMap）
+ */
 async function loadRecords() {
-  if (subjects.value.length === 0 || allStudents.value.length === 0) {
-    records.value = new Map()
+  if (subjectList.value.length === 0 || allStudentList.value.length === 0) {
+    recordMap.value = new Map()
     return
   }
   try {
-    const studentIds = allStudents.value.map((s) => s.id)
-    const { data, error } = await supabase
+    const studentIds = allStudentList.value.map((studentRow) => studentRow.id)
+    const { data: recordRows, error } = await supabase
       .from('homework_records')
       .select('id, student_id, subject_id, is_done')
       .eq('record_date', selectedDate.value)
       .in('student_id', studentIds)
     if (error) throw error
-    const map = new Map<string, RecordRow>()
-    ;(data ?? []).forEach((r: any) => {
-      map.set(recordKey(r.student_id, r.subject_id), r as RecordRow)
+    const loadedRecordMap = new Map<string, RecordRow>()
+    ;(recordRows ?? []).forEach((recordRow: any) => {
+      loadedRecordMap.set(recordKey(recordRow.student_id, recordRow.subject_id), recordRow as RecordRow)
     })
-    records.value = map
-  } catch (err: any) {
-    ElMessage.error(err.message || '加载作业记录失败')
+    recordMap.value = loadedRecordMap
+  } catch (err: unknown) {
+    ElMessage.error(err instanceof Error && err.message ? err.message : '加载作业记录失败')
   }
 }
 
+/**
+ * 切换某个学生在某科目上的完成状态：没有记录时新增一条并记为已完成，
+ * 已有记录时把 is_done 取反后更新。
+ * @param studentId 学生 ID
+ * @param subjectId 科目 ID
+ * @returns 无返回值；成功后同步更新本地 recordMap
+ */
 async function toggleRecord(studentId: string, subjectId: string) {
   if (!userStore.schoolId || !userStore.id) return
-  const key = recordKey(studentId, subjectId)
-  const existing = records.value.get(key)
+  const cellKey = recordKey(studentId, subjectId)
+  const existingRecord = recordMap.value.get(cellKey)
   const now = new Date().toISOString()
 
-  const studentClassId = allStudents.value.find((s) => s.id === studentId)?.class_id || effectiveClassId.value || undefined
+  const studentClassId = allStudentList.value.find((studentRow) => studentRow.id === studentId)?.class_id || effectiveClassId.value || undefined
 
   try {
-    if (existing) {
-      const newDone = !existing.is_done
+    if (existingRecord) {
+      const newDone = !existingRecord.is_done
       const { error } = await supabase
         .from('homework_records')
         .update({
@@ -239,12 +316,12 @@ async function toggleRecord(studentId: string, subjectId: string) {
           update_user_id: userStore.id,
           update_time: now,
         })
-        .eq('id', existing.id)
+        .eq('id', existingRecord.id)
       if (error) throw error
-      const updated = { ...existing, is_done: newDone }
-      records.value.set(key, updated)
+      const updated = { ...existingRecord, is_done: newDone }
+      recordMap.value.set(cellKey, updated)
     } else {
-      const { data, error } = await supabase
+      const { data: insertedRows, error } = await supabase
         .from('homework_records')
         .insert({
           school_id: userStore.schoolId,
@@ -258,84 +335,116 @@ async function toggleRecord(studentId: string, subjectId: string) {
         })
         .select()
       if (error) throw error
-      const row = (data ?? [])[0] as RecordRow | undefined
-      if (row) {
-        records.value.set(key, row)
+      const insertedRow = (insertedRows ?? [])[0] as RecordRow | undefined
+      if (insertedRow) {
+        recordMap.value.set(cellKey, insertedRow)
       }
     }
-  } catch (err: any) {
-    ElMessage.error(err.message || '更新作业状态失败')
+  } catch (err: unknown) {
+    ElMessage.error(err instanceof Error && err.message ? err.message : '更新作业状态失败')
   }
 }
 
+/**
+ * 计算某个单元格的展示状态。
+ * @param studentId 学生 ID
+ * @param subjectId 科目 ID
+ * @returns done=已完成，pending=已登记未完成，none=当天无记录
+ */
 function getCellStatus(studentId: string, subjectId: string): 'done' | 'pending' | 'none' {
-  const rec = records.value.get(recordKey(studentId, subjectId))
-  if (!rec) return 'none'
-  return rec.is_done ? 'done' : 'pending'
+  const homeworkRecord = recordMap.value.get(recordKey(studentId, subjectId))
+  if (!homeworkRecord) return 'none'
+  return homeworkRecord.is_done ? 'done' : 'pending'
 }
 
+/**
+ * 加载当前班级在所选日期下的作业内容备注。
+ * @returns 无返回值（副作用：写入 noteList）
+ */
 async function loadNotes() {
   if (!effectiveClassId.value) return
   try {
-    const { data, error } = await supabase
+    const { data: noteRows, error } = await supabase
       .from('homework_notes')
       .select('id, subject_id, subject_name, content')
       .eq('class_id', effectiveClassId.value)
       .eq('record_date', selectedDate.value)
     if (error) throw error
-    notes.value = (data ?? []) as NoteRow[]
-  } catch (err: any) {
-    // 表可能不存在，静默
+    noteList.value = (noteRows ?? []) as NoteRow[]
+    syncNoteDraft()
+  } catch (err: unknown) {
+    // 读取失败会让"备注墙"空白，这里必须让用户看见原因，不能静默吞掉
+    ElMessage.error(err instanceof Error && err.message ? err.message : '加载作业备注失败')
   }
 }
 
+/**
+ * 保存某个科目当天的作业内容：已有备注则更新，内容为空则删除，不存在则新增。
+ * @param subjectId 科目 ID
+ * @param content 作业内容文本
+ * @returns 无返回值；成功后重新加载备注并提示
+ */
 async function saveNoteContent(subjectId: string, content: string) {
   const classId = effectiveClassId.value
-  if (!classId) return
-  const subjectName = subjects.value.find((s) => s.id === subjectId)?.subject_name
-  const existing = notes.value.find((n) => n.subject_id === subjectId)
-  const trimmed = content.trim()
+  if (!classId) {
+    // 学校管理员未选班级时无法定位作业归属，直接说清原因，避免"点了没反应"
+    ElMessage.warning('请先在上方选择班级')
+    return
+  }
+  const subjectName = subjectList.value.find((subjectRow) => subjectRow.id === subjectId)?.subject_name
+  const existingNote = noteList.value.find((noteItem) => noteItem.subject_id === subjectId)
+  const trimmedContent = content.trim()
+  // 与已保存内容一致：不发请求、也不提示，避免一失焦就弹"备注已保存"
+  if ((existingNote?.content ?? '') === trimmedContent) return
   try {
-    if (existing) {
-      if (!trimmed) {
-        // 删除空内容
-        const { error } = await supabase.from('homework_notes').delete().eq('id', existing.id)
+    if (existingNote) {
+      if (!trimmedContent) {
+        // 清空已有备注等价于删除
+        const { error } = await supabase.from('homework_notes').delete().eq('id', existingNote.id)
         if (error) throw error
       } else {
         const { error } = await supabase
           .from('homework_notes')
-          .update({ content: trimmed })
-          .eq('id', existing.id)
+          .update({ content: trimmedContent })
+          .eq('id', existingNote.id)
         if (error) throw error
       }
-    } else if (trimmed) {
+    } else {
+      // 原本就没有备注且内容为空：无内容可落库，静默结束，不再谎报"已保存"
+      if (!trimmedContent) return
       const { error } = await supabase.from('homework_notes').insert({
         school_id: userStore.schoolId,
         class_id: classId,
         record_date: selectedDate.value,
         subject_id: subjectId,
         subject_name: subjectName,
-        content: trimmed,
+        content: trimmedContent,
       })
       if (error) throw error
     }
     await loadNotes()
     ElMessage.success('备注已保存')
-  } catch (err: any) {
-    ElMessage.error(err.message || '保存备注失败')
+  } catch (err: unknown) {
+    ElMessage.error(err instanceof Error && err.message ? err.message : '保存备注失败')
   }
 }
 
+/**
+ * 看板初始化入口：并行加载科目、学生、备注，再按依赖顺序加载作业记录。
+ * @returns 无返回值（副作用：维护 boardLoading 状态，并写入各列表数据）
+ */
 async function loadAll() {
-  loading.value = true
+  boardLoading.value = true
   try {
     await Promise.all([loadSubjects(), loadStudents(), loadNotes()])
     await loadRecords()
     if (!effectiveClassId.value) {
-      notes.value = []
+      noteList.value = []
     }
+    // loadNotes 可能与 loadSubjects 并行完成，科目列表后到时需再同步一次草稿
+    syncNoteDraft()
   } finally {
-    loading.value = false
+    boardLoading.value = false
   }
 }
 
@@ -380,10 +489,10 @@ onMounted(async () => {
             style="width: 160px"
           >
             <el-option
-              v-for="sub in subjects"
-              :key="sub.id"
-              :label="sub.subject_name || sub.name"
-              :value="sub.id"
+              v-for="subjectItem in subjectList"
+              :key="subjectItem.id"
+              :label="subjectItem.subject_name || subjectItem.name"
+              :value="subjectItem.id"
             />
           </el-select>
           <el-switch
@@ -398,19 +507,19 @@ onMounted(async () => {
         </div>
         <div class="toolbar-right">
           <el-select
-            v-if="userStore.role === 'school_admin'"
+            v-if="schoolClasses.length > 0"
             v-model="filterClassId"
-            clearable
-            placeholder="按班级筛选"
-            style="width: 180px"
+            :clearable="userStore.role === 'school_admin'"
+            :placeholder="userStore.role === 'school_admin' ? '按班级筛选' : '切换班级'"
+            style="width: 190px"
             size="small"
           >
-            <el-option label="全部班级" value="" />
+            <el-option v-if="userStore.role === 'school_admin'" label="全部班级" value="" />
             <el-option
-              v-for="c in schoolClasses"
-              :key="c.id"
-              :label="c.class_name"
-              :value="c.id"
+              v-for="classOption in schoolClasses"
+              :key="classOption.id"
+              :label="classOption.class_name"
+              :value="classOption.id"
             />
           </el-select>
           <el-button :icon="Setting" @click="subjectDialogVisible = true">科目管理</el-button>
@@ -424,55 +533,55 @@ onMounted(async () => {
       <div class="quick-input-row">
         <span class="quick-label">📝 快速录入：</span>
         <div
-          v-for="sub in subjects"
-          :key="sub.id"
+          v-for="subjectItem in subjectList"
+          :key="subjectItem.id"
           class="quick-item"
         >
-          <span class="quick-subject">{{ sub.subject_name || sub.name }}</span>
+          <span class="quick-subject">{{ subjectItem.subject_name || subjectItem.name }}</span>
           <el-input
+            v-model="noteDraft[subjectItem.id]"
             class="quick-input"
-            :model-value="notes.find((n) => n.subject_id === sub.id)?.content || ''"
             placeholder="作业内容…"
             size="small"
             clearable
-            @blur="(e: FocusEvent) => saveNoteContent(sub.id, (e.target as HTMLInputElement).value)"
-            @keyup.enter="(e: KeyboardEvent) => saveNoteContent(sub.id, (e.target as HTMLInputElement).value)"
+            @blur="saveNoteContent(subjectItem.id, noteDraft[subjectItem.id] ?? '')"
+            @keyup.enter="saveNoteContent(subjectItem.id, noteDraft[subjectItem.id] ?? '')"
           />
         </div>
       </div>
 
       <!-- 第二层：卡片展示（晚自习作业墙） -->
-      <div class="card-wall" v-if="notes.length > 0">
+      <div class="card-wall" v-if="noteList.length > 0">
         <div
-          v-for="sub in subjects"
-          :key="sub.id"
+          v-for="subjectItem in subjectList"
+          :key="subjectItem.id"
           class="hw-card"
         >
           <div
-            v-if="notes.find((n) => n.subject_id === sub.id)"
+            v-if="noteList.find((noteItem) => noteItem.subject_id === subjectItem.id)"
             class="hw-card-inner"
           >
             <div class="hw-card-header">
               <span
                 class="hw-subject-badge"
-                :style="{ background: subjectColor(sub.id) }"
+                :style="{ background: subjectColor(subjectItem.id) }"
               >
-                {{ sub.subject_name || sub.name }}
+                {{ subjectItem.subject_name || subjectItem.name }}
               </span>
               <div class="hw-card-actions">
                 <el-tooltip content="编辑" placement="top">
-                  <el-button link size="small" @click="startEditCard(sub)">✏️</el-button>
+                  <el-button link size="small" @click="startEditCard(subjectItem)">✏️</el-button>
                 </el-tooltip>
                 <el-tooltip content="删除" placement="top">
-                  <el-button link size="small" @click="deleteCardNote(sub.id)">🗑️</el-button>
+                  <el-button link size="small" @click="deleteCardNote(subjectItem.id)">🗑️</el-button>
                 </el-tooltip>
               </div>
             </div>
             <div
-              v-if="editingSubjectId !== sub.id"
+              v-if="editingSubjectId !== subjectItem.id"
               class="hw-card-body"
               :style="{ whiteSpace: 'pre-wrap' }"
-            >{{ notes.find((n) => n.subject_id === sub.id)?.content }}</div>
+            >{{ noteList.find((noteItem) => noteItem.subject_id === subjectItem.id)?.content }}</div>
             <div v-else class="hw-card-edit">
               <el-input
                 v-model="editingContent"
@@ -490,8 +599,8 @@ onMounted(async () => {
           <div v-else class="hw-card hw-card-empty">
             <div class="hw-card-inner" style="opacity: 0.45">
               <div class="hw-card-header">
-                <span class="hw-subject-badge" :style="{ background: subjectColor(sub.id) }">
-                  {{ sub.subject_name || sub.name }}
+                <span class="hw-subject-badge" :style="{ background: subjectColor(subjectItem.id) }">
+                  {{ subjectItem.subject_name || subjectItem.name }}
                 </span>
               </div>
               <div class="hw-card-body hw-card-body-empty">未布置作业</div>
@@ -504,28 +613,28 @@ onMounted(async () => {
       </div>
     </div>
 
-    <el-table :data="filteredStudents" v-loading="loading" border stripe style="width: 100%">
+    <el-table :data="filteredStudents" v-loading="boardLoading" border stripe style="width: 100%">
       <el-table-column label="学生姓名" width="140" fixed="left">
-        <template #default="{ row }">
-          {{ row.student_name || row.name }}
+        <template #default="{ row: studentRow }">
+          {{ studentRow.student_name || studentRow.name }}
         </template>
       </el-table-column>
       <el-table-column
-        v-for="sub in filteredSubjects"
-        :key="sub.id"
-        :label="sub.subject_name || sub.name"
+        v-for="subjectItem in filteredSubjects"
+        :key="subjectItem.id"
+        :label="subjectItem.subject_name || subjectItem.name"
         min-width="100"
         align="center"
       >
-        <template #default="{ row }">
+        <template #default="{ row: studentRow }">
           <button
             class="status-cell"
-            :class="`status-${getCellStatus(row.id, sub.id)}`"
-            :title="`${row.student_name || row.name} - ${sub.subject_name}`"
-            @click="toggleRecord(row.id, sub.id)"
+            :class="`status-${getCellStatus(studentRow.id, subjectItem.id)}`"
+            :title="`${studentRow.student_name || studentRow.name} - ${subjectItem.subject_name}`"
+            @click="toggleRecord(studentRow.id, subjectItem.id)"
           >
-            <span v-if="getCellStatus(row.id, sub.id) === 'done'">✅</span>
-            <span v-else-if="getCellStatus(row.id, sub.id) === 'pending'">⬜</span>
+            <span v-if="getCellStatus(studentRow.id, subjectItem.id) === 'done'">✅</span>
+            <span v-else-if="getCellStatus(studentRow.id, subjectItem.id) === 'pending'">⬜</span>
             <span v-else>◯</span>
           </button>
         </template>

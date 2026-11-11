@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, onMounted, computed, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Plus, Edit, Delete, Upload, Download, Document } from '@element-plus/icons-vue'
+import { Plus, Edit, Delete, Upload, Download, Document, Key } from '@element-plus/icons-vue'
 import { supabase } from '@/api/supabase'
 import { useUserStore } from '@/stores/user'
 import { exportToExcel } from '@/utils/excel'
@@ -77,24 +77,173 @@ const allScores = ref<ScoreRow[]>([])
 const loading = ref(false)
 
 const filterClassId = ref<string>('')
-const schoolClasses = ref<{ id: string; class_name: string }[]>([])
+const schoolClasses = ref<{ id: string; class_name: string; homeroom_teacher_id?: string | null }[]>([])
+/** 教师身份下：本人被授权访问成绩的班级 id 列表 */
+const grantedClassIds = ref<string[]>([])
 
+/**
+ * 当前实际操作的班级。
+ * 学校管理员用顶部下拉选择（可为空＝本校全部）；教师用下拉选择，默认回落到自己绑定的班。
+ */
 const effectiveClassId = computed<string | null>(() => {
   if (userStore.role === 'school_admin') return filterClassId.value || null
-  return userStore.classId || null
+  return filterClassId.value || userStore.boundClassId || null
 })
 
+/**
+ * 当前班级是否由本人担任班主任 —— 决定「成绩授权」按钮是否可用。
+ * 与后端 fn_is_homeroom_of 口径保持一致：classes.homeroom_teacher_id 优先；
+ * 该字段未维护时（如种子数据）回退到 profiles.class_id（即 store 的 boundClassId）。
+ * @returns 是否可管理本班成绩授权
+ */
+const canGrantForCurrentClass = computed(() => {
+  if (userStore.role !== 'teacher' || !effectiveClassId.value) return false
+  const currentClass = schoolClasses.value.find((classItem) => classItem.id === effectiveClassId.value)
+  if (currentClass?.homeroom_teacher_id) return currentClass.homeroom_teacher_id === userStore.id
+  return effectiveClassId.value === userStore.boundClassId
+})
+
+/**
+ * 加载顶部下拉的班级列表。
+ * 学校管理员＝本校全部班级；教师＝本人绑定的班 + 已被班主任授权访问成绩的班。
+ * @returns 无返回值（副作用：写入 schoolClasses，教师场景下同时刷新 grantedClassIds）
+ */
 async function loadSchoolClasses() {
-  if (userStore.role !== 'school_admin' || !userStore.schoolId) return
+  if (!userStore.schoolId) return
   try {
-    const { data, error } = await supabase
+    if (userStore.role === 'school_admin') {
+      const { data: classRows, error } = await supabase
+        .from('classes')
+        .select('id, class_name, homeroom_teacher_id')
+        .eq('school_id', userStore.schoolId)
+      if (error) throw error
+      schoolClasses.value = (classRows ?? []) as typeof schoolClasses.value
+      return
+    }
+    // 教师：自己绑定的班 + 已获授权的班
+    const { data: grantRows, error: grantError } = await supabase
+      .from('grade_access_grants')
+      .select('class_id')
+      .eq('teacher_id', userStore.id)
+    if (grantError) throw grantError
+    grantedClassIds.value = Array.from(new Set((grantRows ?? []).map((grant: any) => grant.class_id as string)))
+    const wantedIds = Array.from(
+      new Set([userStore.boundClassId, ...grantedClassIds.value].filter(Boolean) as string[]),
+    )
+    if (wantedIds.length === 0) {
+      schoolClasses.value = []
+      return
+    }
+    const { data: classRows, error } = await supabase
       .from('classes')
-      .select('id, class_name')
-      .eq('school_id', userStore.schoolId)
+      .select('id, class_name, homeroom_teacher_id')
+      .in('id', wantedIds)
     if (error) throw error
-    schoolClasses.value = (data ?? []) as { id: string; class_name: string }[]
-  } catch (err: any) {
-    ElMessage.error(err.message || '加载班级列表失败')
+    // 本班排在最前，方便一眼选中
+    schoolClasses.value = ((classRows ?? []) as typeof schoolClasses.value).sort(
+      (classA, classB) =>
+        Number(classB.id === userStore.boundClassId) - Number(classA.id === userStore.boundClassId),
+    )
+    // 教师下拉不提供"全部"选项，未选时默认落在自己的班
+    if (!filterClassId.value) filterClassId.value = userStore.boundClassId || ''
+  } catch (err: unknown) {
+    ElMessage.error(err instanceof Error && err.message ? err.message : '加载班级列表失败')
+  }
+}
+
+// ===== 成绩授权（班主任把本班成绩开放给本校其他老师）=====
+const grantDialogVisible = ref(false)
+const grantLoading = ref(false)
+const grantSaving = ref(false)
+/** 弹窗内列出的同校教师及其当前授权状态 */
+const grantCandidates = ref<{ id: string; real_name: string; roleLabel: string; granted: boolean }[]>([])
+/** 弹窗内被勾选（= 允许访问本班成绩）的教师 id */
+const grantSelectedIds = ref<string[]>([])
+
+/**
+ * 打开成绩授权弹窗：列出本校教师（含学校管理员）并标出已授权的人。
+ * 只列同校 —— 跨校账号既看不到、后端也不允许授权（fn_is_same_school_user）。
+ * @returns 无返回值（副作用：写入 grantCandidates）
+ */
+async function openGrantDialog() {
+  const targetClassId = effectiveClassId.value
+  if (!targetClassId || !userStore.schoolId) return
+  grantDialogVisible.value = true
+  grantLoading.value = true
+  try {
+    const { data: teacherRows, error } = await supabase
+      .from('profiles')
+      .select('id, real_name, name, role')
+      .eq('school_id', userStore.schoolId)
+      .in('role', ['teacher', 'school_admin'])
+      .order('real_name', { ascending: true })
+    if (error) throw error
+    const { data: grantRows, error: grantError } = await supabase
+      .from('grade_access_grants')
+      .select('teacher_id')
+      .eq('class_id', targetClassId)
+    if (grantError) throw grantError
+    const grantedIds = new Set((grantRows ?? []).map((grant: any) => grant.teacher_id as string))
+    grantCandidates.value = ((teacherRows ?? []) as any[])
+      .filter((teacherRow) => teacherRow.id !== userStore.id)
+      .map((teacherRow) => ({
+        id: teacherRow.id,
+        real_name: teacherRow.real_name || teacherRow.name || '未命名',
+        roleLabel: teacherRow.role === 'school_admin' ? '学校管理员' : '教师',
+        granted: grantedIds.has(teacherRow.id),
+      }))
+    grantSelectedIds.value = grantCandidates.value.filter((candidate) => candidate.granted).map((candidate) => candidate.id)
+  } catch (err: unknown) {
+    ElMessage.error(err instanceof Error && err.message ? err.message : '加载教师列表失败')
+  } finally {
+    grantLoading.value = false
+  }
+}
+
+/**
+ * 保存授权名单：按勾选差异做增删（插入容忍重复由唯一约束兜底，撤销按行 id 删除）。
+ * @returns 无返回值
+ */
+async function saveGrants() {
+  const targetClassId = effectiveClassId.value
+  if (!targetClassId || !userStore.schoolId) return
+  grantSaving.value = true
+  try {
+    const { data: existingRows, error: readError } = await supabase
+      .from('grade_access_grants')
+      .select('id, teacher_id')
+      .eq('class_id', targetClassId)
+    if (readError) throw readError
+    const existingMap = new Map(((existingRows ?? []) as any[]).map((row) => [row.teacher_id as string, row.id as string]))
+    const wantedIds = new Set(grantSelectedIds.value)
+
+    const addedIds = Array.from(wantedIds).filter((teacherId) => !existingMap.has(teacherId))
+    const removedRowIds = Array.from(existingMap.entries())
+      .filter(([teacherId]) => !wantedIds.has(teacherId))
+      .map(([, rowId]) => rowId)
+
+    if (addedIds.length > 0) {
+      const { error } = await supabase.from('grade_access_grants').insert(
+        addedIds.map((teacherId) => ({
+          school_id: userStore.schoolId,
+          class_id: targetClassId,
+          teacher_id: teacherId,
+          granted_by: userStore.id,
+        })),
+      )
+      if (error) throw error
+    }
+    if (removedRowIds.length > 0) {
+      const { error } = await supabase.from('grade_access_grants').delete().in('id', removedRowIds)
+      if (error) throw error
+    }
+    ElMessage.success(`授权已更新（新增 ${addedIds.length} 人，撤销 ${removedRowIds.length} 人）`)
+    grantDialogVisible.value = false
+    await loadSchoolClasses()
+  } catch (err: unknown) {
+    ElMessage.error(err instanceof Error && err.message ? err.message : '保存授权失败')
+  } finally {
+    grantSaving.value = false
   }
 }
 
@@ -104,36 +253,36 @@ const currentExamDate = ref('')
 
 const subjectColumns = computed(() => {
   if (!currentExam.value) return []
-  const set = new Set<string>()
+  const subjectSet = new Set<string>()
   allScores.value
-    .filter((s) => s.exam_name === currentExam.value)
-    .forEach((s) => set.add(s.subject))
-  return Array.from(set).sort()
+    .filter((score) => score.exam_name === currentExam.value)
+    .forEach((score) => subjectSet.add(score.subject))
+  return Array.from(subjectSet).sort()
 })
 
 const matrixRows = computed<MatrixRow[]>(() => {
   if (!currentExam.value) return []
-  const examScores = allScores.value.filter((s) => s.exam_name === currentExam.value)
+  const examScores = allScores.value.filter((score) => score.exam_name === currentExam.value)
   const scoreMap = new Map<string, ScoreRow>()
-  examScores.forEach((s) => scoreMap.set(`${s.student_id}|${s.subject}`, s))
-  const cols = subjectColumns.value
-  return students.value.map((stu) => {
+  examScores.forEach((score) => scoreMap.set(`${score.student_id}|${score.subject}`, score))
+  const subjectNames = subjectColumns.value
+  return students.value.map((student) => {
     const cells: Record<string, MatrixCell> = {}
     let total = 0
     let scoreCount = 0
-    cols.forEach((subj) => {
-      const s = scoreMap.get(`${stu.id}|${subj}`)
-      if (s) {
-        cells[subj] = { id: s.id, score: s.score, full_score: s.full_score }
-        total += s.score
+    subjectNames.forEach((subjectName) => {
+      const score = scoreMap.get(`${student.id}|${subjectName}`)
+      if (score) {
+        cells[subjectName] = { id: score.id, score: score.score, full_score: score.full_score }
+        total += score.score
         scoreCount++
       } else {
-        cells[subj] = { score: null, full_score: 100 }
+        cells[subjectName] = { score: null, full_score: 100 }
       }
     })
     return {
-      student_id: stu.id,
-      student_name: stu.student_name,
+      student_id: student.id,
+      student_name: student.student_name,
       cells,
       total,
       avg: scoreCount > 0 ? +(total / scoreCount).toFixed(1) : 0,
@@ -143,24 +292,24 @@ const matrixRows = computed<MatrixRow[]>(() => {
 })
 
 const totalScoreCells = computed(() =>
-  matrixRows.value.reduce((s, r) => s + r.scoreCount, 0),
+  matrixRows.value.reduce((sum, matrixRow) => sum + matrixRow.scoreCount, 0),
 )
 
 const classAvg = computed(() => {
-  const rows = matrixRows.value.filter((r) => r.scoreCount > 0)
-  if (rows.length === 0) return 0
-  const total = rows.reduce((s, r) => s + r.total, 0)
-  const count = rows.reduce((s, r) => s + r.scoreCount, 0)
-  return count > 0 ? +(total / count).toFixed(1) : 0
+  const scoredRows = matrixRows.value.filter((matrixRow) => matrixRow.scoreCount > 0)
+  if (scoredRows.length === 0) return 0
+  const total = scoredRows.reduce((sum, matrixRow) => sum + matrixRow.total, 0)
+  const scoreCount = scoredRows.reduce((sum, matrixRow) => sum + matrixRow.scoreCount, 0)
+  return scoreCount > 0 ? +(total / scoreCount).toFixed(1) : 0
 })
 
 const passRate = computed(() => {
   let totalCells = 0, passCells = 0
-  matrixRows.value.forEach((r) => {
-    Object.values(r.cells).forEach((c) => {
-      if (c.score !== null) {
+  matrixRows.value.forEach((matrixRow) => {
+    Object.values(matrixRow.cells).forEach((cell) => {
+      if (cell.score !== null) {
         totalCells++
-        if (c.score / c.full_score >= 0.6) passCells++
+        if (cell.score / cell.full_score >= 0.6) passCells++
       }
     })
   })
@@ -186,12 +335,17 @@ const cellDialogForm = ref({
   score_id: undefined as string | undefined,
 })
 
-function openCellEditor(row: MatrixRow, subject: string) {
-  const cell = row.cells[subject]
+/**
+ * 打开单元格成绩编辑弹窗，并把该单元格已有成绩回填到弹窗表单
+ * @param matrixRow 成绩矩阵中该学生所在行
+ * @param subjectName 被点击的学科列名
+ */
+function openCellEditor(matrixRow: MatrixRow, subjectName: string) {
+  const cell = matrixRow.cells[subjectName]
   cellDialogForm.value = {
-    student_id: row.student_id,
-    student_name: row.student_name,
-    subject,
+    student_id: matrixRow.student_id,
+    student_name: matrixRow.student_name,
+    subject: subjectName,
     score: cell.score ?? 0,
     full_score: cell.full_score,
     score_id: cell.id,
@@ -199,6 +353,10 @@ function openCellEditor(row: MatrixRow, subject: string) {
   cellDialogVisible.value = true
 }
 
+/**
+ * 提交单元格成绩：已有成绩走更新、无成绩走新增，成功后刷新矩阵
+ * @returns 无返回值（副作用：写库、关闭弹窗、重新加载数据）
+ */
 async function handleCellSubmit() {
   if (cellDialogForm.value.score < 0 || cellDialogForm.value.score > cellDialogForm.value.full_score) {
     ElMessage.warning(`分数范围应在 0 ~ ${cellDialogForm.value.full_score} 之间`)
@@ -216,7 +374,7 @@ async function handleCellSubmit() {
       if (error) throw error
       ElMessage.success('更新成功')
     } else {
-      const studentName = students.value.find((s) => s.id === cellDialogForm.value.student_id)?.student_name
+      const studentName = students.value.find((student) => student.id === cellDialogForm.value.student_id)?.student_name
       const { error } = await supabase.from('student_scores').insert({
         student_id: cellDialogForm.value.student_id,
         student_name: studentName,
@@ -234,11 +392,14 @@ async function handleCellSubmit() {
     }
     cellDialogVisible.value = false
     await loadAll()
-  } catch (err: any) {
-    ElMessage.error(err.message || '保存失败')
+  } catch (err: unknown) {
+    ElMessage.error(err instanceof Error && err.message ? err.message : '保存失败')
   }
 }
 
+/**
+ * 删除当前单元格对应的成绩记录（先二次确认，用户取消则直接返回）
+ */
 async function handleCellDelete() {
   if (!cellDialogForm.value.score_id) {
     ElMessage.warning('该单元格尚无成绩记录')
@@ -247,6 +408,7 @@ async function handleCellDelete() {
   try {
     await ElMessageBox.confirm('确定删除该条成绩吗？', '提示', { type: 'warning' })
   } catch {
+    // 用户在确认框中点了「取消」，此处静默返回即可
     return
   }
   try {
@@ -258,8 +420,8 @@ async function handleCellDelete() {
     ElMessage.success('删除成功')
     cellDialogVisible.value = false
     await loadAll()
-  } catch (err: any) {
-    ElMessage.error(err.message || '删除失败')
+  } catch (err: unknown) {
+    ElMessage.error(err instanceof Error && err.message ? err.message : '删除失败')
   }
 }
 
@@ -267,26 +429,32 @@ async function handleCellDelete() {
 const newExamVisible = ref(false)
 const newExamForm = ref({ name: '', date: new Date().toISOString().slice(0, 10) })
 
+/**
+ * 打开「新增考试」弹窗，并重置考试名称与日期
+ */
 function openNewExam() {
   newExamForm.value = { name: '', date: new Date().toISOString().slice(0, 10) }
   newExamVisible.value = true
 }
 
+/**
+ * 创建考试：校验名称非空且不重名后写入 localStorage，并自动切换为当前考试
+ */
 function handleNewExam() {
   if (!newExamForm.value.name.trim()) {
     ElMessage.warning('请输入考试名称')
     return
   }
-  if (examOptions.value.find((e) => e.name === newExamForm.value.name.trim())) {
+  if (examOptions.value.find((examOption) => examOption.name === newExamForm.value.name.trim())) {
     ElMessage.warning('该考试名称已存在')
     return
   }
-  const key = 'MOCK_EXAMS'
-  const raw = localStorage.getItem(key)
-  const list: { name: string; date: string }[] = raw ? JSON.parse(raw) : []
-  list.push({ name: newExamForm.value.name.trim(), date: newExamForm.value.date })
-  localStorage.setItem(key, JSON.stringify(list))
-  examOptions.value = list
+  const storageKey = 'MOCK_EXAMS'
+  const storedExams = localStorage.getItem(storageKey)
+  const examList: { name: string; date: string }[] = storedExams ? JSON.parse(storedExams) : []
+  examList.push({ name: newExamForm.value.name.trim(), date: newExamForm.value.date })
+  localStorage.setItem(storageKey, JSON.stringify(examList))
+  examOptions.value = examList
   currentExam.value = newExamForm.value.name.trim()
   currentExamDate.value = newExamForm.value.date
   newExamVisible.value = false
@@ -294,57 +462,66 @@ function handleNewExam() {
 }
 
 // ===== Excel 导入（宽表格式）=====
+/**
+ * 下载成绩导入模板：第一列为学生姓名，其余列按当前考试的学科生成示例分数
+ */
 function downloadTemplate() {
-  const wb = XLSX.utils.book_new()
-  const subs = subjectColumns.value.length > 0 ? subjectColumns.value : ['语文', '数学', '英语']
+  const workbook = XLSX.utils.book_new()
+  const subjectNames = subjectColumns.value.length > 0 ? subjectColumns.value : ['语文', '数学', '英语']
   const examName = currentExam.value || '本次考试'
-  const header = ['学生姓名', ...subs]
-  const sample1 = ['张三', ...subs.map(() => 85)]
-  const sample2 = ['李四', ...subs.map(() => 90)]
-  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet([header, sample1, sample2]), examName)
-  XLSX.writeFile(wb, `成绩导入_${examName}.xlsx`)
+  const headerRow = ['学生姓名', ...subjectNames]
+  const sampleRow1 = ['张三', ...subjectNames.map(() => 85)]
+  const sampleRow2 = ['李四', ...subjectNames.map(() => 90)]
+  XLSX.utils.book_append_sheet(workbook, XLSX.utils.aoa_to_sheet([headerRow, sampleRow1, sampleRow2]), examName)
+  XLSX.writeFile(workbook, `成绩导入_${examName}.xlsx`)
 }
 
+/**
+ * 解析宽表 Excel 并批量覆盖式导入成绩
+ * 第 1 行为表头（学生姓名 + 各学科列）；写入前先按当前考试名删除旧成绩再整批插入
+ * @param file 用户在文件选择框选中的 xlsx/xls 文件
+ * @returns 无返回值（副作用：删旧数据、写库、消息提示、刷新矩阵）
+ */
 async function handleImport(file: File) {
   if (!currentExam.value) {
     ElMessage.warning('请先选择或创建一个考试')
     return
   }
-  const buf = await file.arrayBuffer()
-  const wb = XLSX.read(buf, { type: 'array' })
-  const sheet = wb.Sheets[wb.SheetNames[0]]
-  const rows = XLSX.utils.sheet_to_json(sheet, { header: 1 }) as any[][]
-  if (rows.length < 2) {
+  const fileBuffer = await file.arrayBuffer()
+  const workbook = XLSX.read(fileBuffer, { type: 'array' })
+  const worksheet = workbook.Sheets[workbook.SheetNames[0]]
+  const sheetRows = XLSX.utils.sheet_to_json(worksheet, { header: 1 }) as any[][]
+  if (sheetRows.length < 2) {
     ElMessage.warning('模板内容为空')
     return
   }
-  const headers = rows[0].map((h) => String(h).trim())
-  const headerSubjects = headers.slice(1)
+  const headerCells = sheetRows[0].map((cellText) => String(cellText).trim())
+  const importSubjects = headerCells.slice(1)
 
-  const records: ScoreRow[] = []
+  const scoreRecords: ScoreRow[] = []
   const session = (await supabase.auth.getSession()).data.session
   const operatorId = session?.user.id
 
-  for (let i = 1; i < rows.length; i++) {
-    const row = rows[i]
-    if (!row || row.length < 2) continue
-    const name = String(row[0] ?? '').trim()
+  for (let rowIndex = 1; rowIndex < sheetRows.length; rowIndex++) {
+    const sheetRow = sheetRows[rowIndex]
+    if (!sheetRow || sheetRow.length < 2) continue
+    const name = String(sheetRow[0] ?? '').trim()
     if (!name) continue
-    const student = students.value.find((s) => s.student_name === name)
+    const student = students.value.find((candidate) => candidate.student_name === name)
     if (!student) {
-      ElMessage.warning(`第 ${i + 1} 行：未找到学生「${name}」，已跳过`)
+      ElMessage.warning(`第 ${rowIndex + 1} 行：未找到学生「${name}」，已跳过`)
       continue
     }
-    for (let j = 0; j < headerSubjects.length; j++) {
-      const val = row[j + 1]
-      if (val === undefined || val === null || val === '') continue
-      const score = Number(val)
+    for (let subjectIdx = 0; subjectIdx < importSubjects.length; subjectIdx++) {
+      const cellValue = sheetRow[subjectIdx + 1]
+      if (cellValue === undefined || cellValue === null || cellValue === '') continue
+      const score = Number(cellValue)
       if (isNaN(score)) continue
-      records.push({
+      scoreRecords.push({
         id: '',
         student_id: student.id,
         student_name: student.student_name,
-        subject: headerSubjects[j],
+        subject: importSubjects[subjectIdx],
         exam_name: currentExam.value,
         exam_date: currentExamDate.value,
         score,
@@ -353,68 +530,78 @@ async function handleImport(file: File) {
     }
   }
 
-  if (records.length === 0) {
+  if (scoreRecords.length === 0) {
     ElMessage.warning('没有可导入的有效记录')
     return
   }
 
   try {
-    const { data: existing } = await supabase
+    const { data: existingRows } = await supabase
       .from('student_scores')
       .select('id')
       .eq('exam_name', currentExam.value)
-    const existingIds = (existing ?? []).map((s: any) => s.id)
-    if (existingIds.length > 0) {
-      await supabase.from('student_scores').delete().in('id', existingIds)
+    const existingScoreIds = (existingRows ?? []).map((scoreRow: any) => scoreRow.id)
+    if (existingScoreIds.length > 0) {
+      await supabase.from('student_scores').delete().in('id', existingScoreIds)
     }
     const { error } = await supabase.from('student_scores').insert(
-      records.map((r) => ({
-        student_id: r.student_id,
-        student_name: r.student_name,
-        subject: r.subject,
-        exam_name: r.exam_name,
-        exam_date: r.exam_date,
-        score: r.score,
-        full_score: r.full_score,
+      scoreRecords.map((record) => ({
+        student_id: record.student_id,
+        student_name: record.student_name,
+        subject: record.subject,
+        exam_name: record.exam_name,
+        exam_date: record.exam_date,
+        score: record.score,
+        full_score: record.full_score,
         school_id: userStore.schoolId,
         class_id: effectiveClassId.value,
         operator_user_id: operatorId,
       })),
     )
     if (error) throw error
-    ElMessage.success(`成功导入 ${records.length} 条成绩（已覆盖 ${existingIds.length} 条旧数据）`)
+    ElMessage.success(`成功导入 ${scoreRecords.length} 条成绩（已覆盖 ${existingScoreIds.length} 条旧数据）`)
     await loadAll()
-  } catch (err: any) {
-    ElMessage.error(err.message || '导入失败')
+  } catch (err: unknown) {
+    ElMessage.error(err instanceof Error && err.message ? err.message : '导入失败')
   }
 }
 
-function onFileChange(e: Event) {
-  const target = e.target as HTMLInputElement
-  const file = target.files?.[0]
-  if (file) handleImport(file).finally(() => { target.value = '' })
+/**
+ * 文件选择框的 change 事件处理：取到文件后交给批量导入，并在完成后清空 input
+ * @param changeEvent input 元素的 change 事件
+ */
+function onFileChange(changeEvent: Event) {
+  const fileInput = changeEvent.target as HTMLInputElement
+  const file = fileInput.files?.[0]
+  if (file) handleImport(file).finally(() => { fileInput.value = '' })
 }
 
+/**
+ * 导出当前考试的宽表成绩（姓名 + 各学科 + 总分 + 平均分）
+ */
 function handleExport() {
   if (!currentExam.value || matrixRows.value.length === 0) {
     ElMessage.warning('请先选择有成绩的考试')
     return
   }
-  const header = ['学生姓名', ...subjectColumns.value, '总分', '平均分']
-  const body = matrixRows.value.map((r) => {
-    const scores = subjectColumns.value.map((subj) => {
-      const c = r.cells[subj]
-      return c.score !== null ? c.score : ''
+  const headerRow = ['学生姓名', ...subjectColumns.value, '总分', '平均分']
+  const exportRows = matrixRows.value.map((matrixRow) => {
+    const scoreValues = subjectColumns.value.map((subjectName) => {
+      const cell = matrixRow.cells[subjectName]
+      return cell.score !== null ? cell.score : ''
     })
-    return [r.student_name, ...scores, r.total, r.avg]
+    return [matrixRow.student_name, ...scoreValues, matrixRow.total, matrixRow.avg]
   })
-  exportToExcel([header, ...body], `成绩_${currentExam.value}_${Date.now()}.xlsx`)
+  exportToExcel([headerRow, ...exportRows], `成绩_${currentExam.value}_${Date.now()}.xlsx`)
 }
 
 // ===== 数据加载 =====
+/**
+ * 加载学生列表：教师按 class_id 过滤，学校管理员按班级（未选班级时按 school_id）过滤
+ * @returns 无返回值，成功后写入 students 列表
+ */
 async function loadStudents() {
-  if (userStore.role !== 'school_admin' && !userStore.classId) return
-  if (userStore.role === 'school_admin' && !userStore.schoolId) return
+  if (!userStore.schoolId) return
   try {
     let query = supabase
       .from('students')
@@ -427,64 +614,79 @@ async function loadStudents() {
         query = query.eq('school_id', userStore.schoolId)
       }
     } else {
-      query = query.eq('class_id', userStore.classId)
+      // 教师：按当前操作班级取学生（本班 或 已被授权的班）
+      if (!effectiveClassId.value) return
+      query = query.eq('class_id', effectiveClassId.value)
     }
-    const { data, error } = await query
+    const { data: studentRows, error } = await query
     if (error) throw error
-    students.value = (data ?? []) as StudentOpt[]
-  } catch (err: any) {
-    ElMessage.error(err.message || '加载学生列表失败')
+    students.value = (studentRows ?? []) as StudentOpt[]
+  } catch (err: unknown) {
+    ElMessage.error(err instanceof Error && err.message ? err.message : '加载学生列表失败')
   }
 }
 
+/**
+ * 加载全部成绩记录（按考试日期、学科排序），并用学生列表补齐 student_name
+ * @returns 无返回值，成功后写入 allScores，并在 finally 中复位 loading
+ */
 async function loadAllScores() {
   if (!userStore.schoolId) return
   loading.value = true
   try {
-    const { data, error } = await supabase
+    const { data: scoreRows, error } = await supabase
       .from('student_scores')
       .select('*')
       .order('exam_date', { ascending: true })
       .order('subject', { ascending: true })
     if (error) throw error
-    let rows = (data ?? []) as ScoreRow[]
+    let scoreList = (scoreRows ?? []) as ScoreRow[]
     const stuMap: Record<string, string> = {}
-    students.value.forEach((s) => { stuMap[s.id] = s.student_name })
-    rows.forEach((r) => { if (!r.student_name) r.student_name = stuMap[r.student_id] })
-    allScores.value = rows
-  } catch (err: any) {
-    ElMessage.error(err.message || '加载成绩失败')
+    students.value.forEach((student) => { stuMap[student.id] = student.student_name })
+    scoreList.forEach((score) => { if (!score.student_name) score.student_name = stuMap[score.student_id] })
+    allScores.value = scoreList
+  } catch (err: unknown) {
+    ElMessage.error(err instanceof Error && err.message ? err.message : '加载成绩失败')
   } finally {
     loading.value = false
   }
 }
 
+/**
+ * 组装考试下拉：合并 localStorage 中自建的考试与成绩里出现过的考试，按日期倒序
+ */
 function loadExamOptions() {
-  const stored = localStorage.getItem('MOCK_EXAMS')
-  let list: { name: string; date: string }[] = stored ? JSON.parse(stored) : []
-  const existing = new Set(list.map((e) => e.name))
-  allScores.value.forEach((s) => {
-    if (!existing.has(s.exam_name)) {
-      list.push({ name: s.exam_name, date: s.exam_date })
-      existing.add(s.exam_name)
+  const storedExams = localStorage.getItem('MOCK_EXAMS')
+  let examList: { name: string; date: string }[] = storedExams ? JSON.parse(storedExams) : []
+  const existingNames = new Set(examList.map((examOption) => examOption.name))
+  allScores.value.forEach((score) => {
+    if (!existingNames.has(score.exam_name)) {
+      examList.push({ name: score.exam_name, date: score.exam_date })
+      existingNames.add(score.exam_name)
     }
   })
-  list.sort((a, b) => b.date.localeCompare(a.date))
-  examOptions.value = list
-  if (!currentExam.value && list.length > 0) {
-    currentExam.value = list[0].name
-    currentExamDate.value = list[0].date
+  examList.sort((examA, examB) => examB.date.localeCompare(examA.date))
+  examOptions.value = examList
+  if (!currentExam.value && examList.length > 0) {
+    currentExam.value = examList[0].name
+    currentExamDate.value = examList[0].date
   }
 }
 
+/**
+ * 页面数据总入口：先加载成绩，再据此刷新考试下拉
+ */
 async function loadAll() {
   await loadAllScores()
   loadExamOptions()
 }
 
+/**
+ * 切换考试时同步该考试对应的日期（用于新增成绩时的 exam_date）
+ */
 function onExamChange() {
-  const e = examOptions.value.find((x) => x.name === currentExam.value)
-  currentExamDate.value = e?.date || ''
+  const examOption = examOptions.value.find((exam) => exam.name === currentExam.value)
+  currentExamDate.value = examOption?.date || ''
 }
 watch(currentExam, onExamChange)
 
@@ -506,10 +708,10 @@ onMounted(async () => {
         <span class="exam-label">当前考试：</span>
         <el-select v-model="currentExam" placeholder="请选择考试" style="width: 220px" @change="onExamChange">
           <el-option
-            v-for="e in examOptions"
-            :key="e.name"
-            :label="e.name + '（' + (e.date || '无日期') + '）'"
-            :value="e.name"
+            v-for="examOption in examOptions"
+            :key="examOption.name"
+            :label="examOption.name + '（' + (examOption.date || '无日期') + '）'"
+            :value="examOption.name"
           />
         </el-select>
         <el-button type="primary" :icon="Plus" @click="openNewExam">新增考试</el-button>
@@ -517,21 +719,29 @@ onMounted(async () => {
           {{ new Date(currentExamDate).toLocaleDateString('zh-CN') }}
         </el-tag>
         <el-select
-          v-if="userStore.role === 'school_admin'"
+          v-if="userStore.role === 'school_admin' || schoolClasses.length > 1"
           v-model="filterClassId"
-          clearable
-          placeholder="按班级筛选"
-          style="width: 180px"
+          :clearable="userStore.role === 'school_admin'"
+          :placeholder="userStore.role === 'school_admin' ? '按班级筛选' : '切换班级'"
+          style="width: 200px"
           size="small"
         >
-          <el-option label="全部班级" value="" />
+          <el-option v-if="userStore.role === 'school_admin'" label="全部班级" value="" />
           <el-option
-            v-for="c in schoolClasses"
-            :key="c.id"
-            :label="c.class_name"
-            :value="c.id"
+            v-for="classItem in schoolClasses"
+            :key="classItem.id"
+            :label="classItem.class_name"
+            :value="classItem.id"
           />
         </el-select>
+        <el-button
+          v-if="canGrantForCurrentClass"
+          :icon="Key"
+          size="small"
+          @click="openGrantDialog"
+        >
+          成绩授权
+        </el-button>
       </div>
       <div class="exam-right">
         <el-radio-group v-model="lineMode" size="default" style="margin-right: 8px">
@@ -592,26 +802,26 @@ onMounted(async () => {
     <div class="table-wrap" v-if="currentExam">
       <el-table :data="matrixRows" v-loading="loading" border stripe style="width: 100%">
         <el-table-column prop="student_name" label="学生" width="140" fixed="left">
-          <template #default="{ row }">
+          <template #default="{ row: matrixRow }">
             <div class="student-cell">
-              <div class="student-avatar">{{ (row as MatrixRow).student_name.charAt(0) }}</div>
-              <div class="student-name">{{ (row as MatrixRow).student_name }}</div>
+              <div class="student-avatar">{{ (matrixRow as MatrixRow).student_name.charAt(0) }}</div>
+              <div class="student-name">{{ (matrixRow as MatrixRow).student_name }}</div>
             </div>
           </template>
         </el-table-column>
 
         <el-table-column
-          v-for="subj in subjectColumns"
-          :key="subj"
-          :label="subj"
+          v-for="subjectName in subjectColumns"
+          :key="subjectName"
+          :label="subjectName"
           :width="110"
           align="center"
         >
-          <template #default="{ row }">
-            <div class="score-cell" :class="getScoreClass((row as MatrixRow).cells[subj])" @click="openCellEditor(row as MatrixRow, subj)">
-              <template v-if="(row as MatrixRow).cells[subj].score !== null">
-                <span class="score-num">{{ (row as MatrixRow).cells[subj].score }}</span>
-                <span class="score-full">/ {{ (row as MatrixRow).cells[subj].full_score }}</span>
+          <template #default="{ row: matrixRow }">
+            <div class="score-cell" :class="getScoreClass((matrixRow as MatrixRow).cells[subjectName])" @click="openCellEditor(matrixRow as MatrixRow, subjectName)">
+              <template v-if="(matrixRow as MatrixRow).cells[subjectName].score !== null">
+                <span class="score-num">{{ (matrixRow as MatrixRow).cells[subjectName].score }}</span>
+                <span class="score-full">/ {{ (matrixRow as MatrixRow).cells[subjectName].full_score }}</span>
               </template>
               <template v-else>
                 <span class="score-empty">+ 录入</span>
@@ -621,10 +831,10 @@ onMounted(async () => {
         </el-table-column>
 
         <el-table-column label="总分" width="100" align="center" fixed="right">
-          <template #default="{ row }"><span class="score-num total">{{ (row as MatrixRow).total }}</span></template>
+          <template #default="{ row: matrixRow }"><span class="score-num total">{{ (matrixRow as MatrixRow).total }}</span></template>
         </el-table-column>
         <el-table-column label="平均分" width="100" align="center" fixed="right">
-          <template #default="{ row }"><span class="score-num avg">{{ (row as MatrixRow).avg }}</span></template>
+          <template #default="{ row: matrixRow }"><span class="score-num avg">{{ (matrixRow as MatrixRow).avg }}</span></template>
         </el-table-column>
       </el-table>
       <el-empty v-if="matrixRows.length === 0 && !loading" description="暂无学生数据" />
@@ -695,6 +905,42 @@ onMounted(async () => {
         <el-button type="primary" @click="handleNewExam">创建</el-button>
       </template>
     </el-dialog>
+
+    <!-- 成绩授权弹窗（仅本班班主任可见）-->
+    <el-dialog v-model="grantDialogVisible" title="成绩授权" width="520px" destroy-on-close>
+      <el-alert
+        type="info"
+        :closable="false"
+        show-icon
+        style="margin-bottom: 12px"
+      >
+        <template #title>
+          被勾选的老师可以查看并录入「{{ schoolClasses.find((c) => c.id === effectiveClassId)?.class_name || '本班' }}」的成绩。
+          只能授权本校老师。
+        </template>
+      </el-alert>
+      <div v-loading="grantLoading" style="min-height: 120px">
+        <el-empty v-if="!grantLoading && grantCandidates.length === 0" description="本校暂无可授权的老师" />
+        <el-checkbox-group v-model="grantSelectedIds" v-else>
+          <div
+            v-for="candidate in grantCandidates"
+            :key="candidate.id"
+            class="grant-row"
+          >
+            <el-checkbox :value="candidate.id">
+              <span class="grant-name">{{ candidate.real_name }}</span>
+              <el-tag size="small" type="info" effect="plain" style="margin-left: 8px">
+                {{ candidate.roleLabel }}
+              </el-tag>
+            </el-checkbox>
+          </div>
+        </el-checkbox-group>
+      </div>
+      <template #footer>
+        <el-button @click="grantDialogVisible = false">取消</el-button>
+        <el-button type="primary" :loading="grantSaving" @click="saveGrants">保存授权</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -755,4 +1001,8 @@ onMounted(async () => {
 .score-empty { color: #9CA3AF; font-size: 12px; font-weight: 500; }
 .score-cell.cell-good .score-num { color: #10B981; }
 .score-cell.cell-fail .score-num { color: #EF4444; }
+/* 成绩授权弹窗 */
+.grant-row { padding: 6px 4px; border-bottom: 1px solid var(--el-border-color-lighter); }
+.grant-row:last-child { border-bottom: none; }
+.grant-name { font-weight: 500; }
 </style>

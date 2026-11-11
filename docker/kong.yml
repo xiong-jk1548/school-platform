@@ -1,17 +1,32 @@
 # ============================================================
 # Kong 声明式配置 —— Supabase 各服务路由到统一端口
-# 被 docker-compose.yml 中的 kong 服务引用
+# gotrue:v2.160.0 默认无前缀路由（/signup, /token...），监听 8081
+# postgrest:v12 默认无前缀路由（/schools, /students...），监听 3000
+# 前端 Supabase JS client 期望 /auth/v1/* 和 /rest/v1/* 前缀
+# 所以 Kong 需要 strip 掉 /auth/v1 和 /rest/v1
+#
+# 鉴权方式：纯 JWT Bearer Token（前端 localStorage 持久化），不靠 Cookie
+# → credentials: false，所以 Allowed-Headers 可以直接写 "*"
+#
+# 坑（CORS 踩过两轮，第 2 台机器同一天踩了两次）：
+#   1. 本文件是挂载文件不是环境变量，改完必须 docker restart supabase-kong 才生效；
+#   2. 全局 cors 插件不能丢——文件被覆盖后插件没了，全部请求会报
+#      No 'Access-Control-Allow-Origin' header，登录直接失败；
+#   3. headers 白名单不能手写枚举：supabase-js 每次升级都会加新请求头
+#      （accept-profile、x-retry-count、x-client-info...），穷举必漏。
+#      现在写 "*" 是因为 credentials 为 false；哪天要改成 credentials: true，
+#      就必须把 headers 整段删掉，让 Kong 原样反射 Access-Control-Request-Headers。
 # ============================================================
 
 _format_version: '2.1'
 
 services:
   - name: auth
-    url: http://auth:8080
+    url: http://auth:8081
     routes:
       - name: auth
         paths:
-          - /auth
+          - /auth/v1
         strip_path: true
         preserve_host: true
 
@@ -20,7 +35,7 @@ services:
     routes:
       - name: rest
         paths:
-          - /rest
+          - /rest/v1
         strip_path: true
         preserve_host: true
 
@@ -29,6 +44,42 @@ services:
     routes:
       - name: storage
         paths:
-          - /storage
+          - /storage/v1
         strip_path: true
         preserve_host: true
+
+# ============ Plugins ============
+plugins:
+  - name: cors
+    config:
+      # ====  origins 用 "*"：前端构建时不知道部署机 IP，改为运行时跟随访问地址，
+      #       来源端口可能是任意的（同事用局域网 IP 访问），所以允许任意 origin。
+      #       安全性：credentials=false，只用 JWT Bearer，内网环境可接受  ====
+      origins:
+        - "*"
+
+      methods:
+        - GET
+        - POST
+        - PUT
+        - PATCH
+        - DELETE
+        - OPTIONS
+
+      # ====  通配符：内网使用，省得挨个枚举（仅 credentials=false 时合法）  ====
+      headers:
+        - "*"
+
+      exposed_headers:
+        # PostgREST 标准响应头
+        - Content-Range
+        - Content-Location
+        - Content-Profile
+        - Link
+        - Location
+        - X-Total-Count
+        - X-Supabase-Api-Version
+
+      # ====  只用 JWT Bearer，不用 Cookie，所以 credentials: false  ====
+      credentials: false
+      max_age: 3600

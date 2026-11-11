@@ -41,27 +41,41 @@ const editForm = ref<StudentRow>({
   class_id: '',
 })
 
+/**
+ * 加载本校班级下拉数据，并兼容 classes.name / classes.class_name 两种命名。
+ * @returns 无返回值，结果写入响应式变量 classes
+ */
 async function loadClasses() {
   if (!userStore.schoolId) return
   try {
-    const { data, error } = await supabase
+    const { data: classData, error } = await supabase
       .from('classes')
       .select('id, name, class_name')
       .eq('school_id', userStore.schoolId)
       .order('name', { ascending: true })
     if (error) throw error
-    const rows = (data ?? []) as ClassOpt[]
-    rows.forEach((c: any) => { if (!c.name && c.class_name) c.name = c.class_name })
-    classes.value = rows
-  } catch (err: any) {
-    ElMessage.error(err.message || '加载班级下拉失败')
+    const classRows = (classData ?? []) as ClassOpt[]
+    classRows.forEach((classItem: any) => { if (!classItem.name && classItem.class_name) classItem.name = classItem.class_name })
+    classes.value = classRows
+  } catch (err: unknown) {
+    ElMessage.error(err instanceof Error && err.message ? err.message : '加载班级下拉失败')
   }
 }
 
+/**
+ * 按班级 id 查班级显示名（用于学生列表的「班级」列）。
+ * @param classId 班级 id
+ * @returns 班级名；未匹配到时返回 '-'
+ */
 function getClassName(classId: string) {
-  return classes.value.find((c) => c.id === classId)?.name ?? '-'
+  return classes.value.find((classItem) => classItem.id === classId)?.name ?? '-'
 }
 
+/**
+ * 查询本校学生列表，支持「班级」筛选与「姓名/学号」关键词模糊搜索。
+ * 查询结果中会统一补齐 student_name 与 class_name 两个展示字段。
+ * @returns 无返回值，结果写入响应式变量 students
+ */
 async function loadStudents() {
   if (!userStore.schoolId) return
   loading.value = true
@@ -74,37 +88,42 @@ async function loadStudents() {
       query = query.eq('class_id', filterClassId.value)
     }
     if (keyword.value.trim()) {
-      const kw = `%${keyword.value.trim()}%`
-      query = query.or(`student_name.ilike.${kw},name.ilike.${kw},student_no.ilike.${kw}`)
+      const likeKeyword = `%${keyword.value.trim()}%`
+      query = query.or(`student_name.ilike.${likeKeyword},name.ilike.${likeKeyword},student_no.ilike.${likeKeyword}`)
     }
-    const { data, error } = await query.order('student_name', { ascending: true })
+    const { data: studentData, error } = await query.order('student_name', { ascending: true })
     if (error) throw error
 
-    const rows = (data ?? []) as StudentRow[]
-    rows.forEach((s: any) => {
-      if (!s.student_name && s.name) s.student_name = s.name
-      if (!s.name && s.student_name) s.name = s.student_name
+    const studentRows = (studentData ?? []) as StudentRow[]
+    studentRows.forEach((student: any) => {
+      if (!student.student_name && student.name) student.student_name = student.name
+      if (!student.name && student.student_name) student.name = student.student_name
     })
-    for (const s of rows) {
-      s.class_name = getClassName(s.class_id)
+    for (const student of studentRows) {
+      student.class_name = getClassName(student.class_id)
     }
-    students.value = rows
-  } catch (err: any) {
-    ElMessage.error(err.message || '加载学生列表失败')
+    students.value = studentRows
+  } catch (err: unknown) {
+    ElMessage.error(err instanceof Error && err.message ? err.message : '加载学生列表失败')
   } finally {
     loading.value = false
   }
 }
 
+/** 表格导出用的行数据：学生列表映射为中文表头 */
 const exportRows = computed(() =>
-  students.value.map((s) => ({
-    姓名: s.student_name || s.name,
-    学号: s.student_no ?? '',
-    班级: s.class_name ?? '',
-    总积分: s.total_score ?? 0,
+  students.value.map((student) => ({
+    姓名: student.student_name || student.name,
+    学号: student.student_no ?? '',
+    班级: student.class_name ?? '',
+    总积分: student.total_score ?? 0,
   })),
 )
 
+/**
+ * 导出当前学生列表为 Excel；无数据时给出提示。
+ * @returns 无返回值，触发浏览器下载
+ */
 function handleExport() {
   if (exportRows.value.length === 0) {
     ElMessage.warning('暂无可导出的数据')
@@ -114,6 +133,10 @@ function handleExport() {
 }
 
 // ===== 学生 CRUD =====
+/**
+ * 打开「新增学生」弹窗，班级默认取当前筛选班级，其次取第一个班级。
+ * @returns 无返回值，直接控制弹窗与表单状态
+ */
 function openAddStudent() {
   editIsEdit.value = false
   editForm.value = {
@@ -126,16 +149,27 @@ function openAddStudent() {
   editDialogVisible.value = true
 }
 
-function openEditStudent(row: StudentRow) {
+/**
+ * 打开「编辑学生」弹窗，用选中学生的数据回填表单（name 与 student_name 保持一致）。
+ * @param studentRow 被编辑的学生行
+ * @returns 无返回值，直接控制弹窗与表单状态
+ */
+function openEditStudent(studentRow: StudentRow) {
   editIsEdit.value = true
-  editForm.value = { ...row, student_name: row.student_name || row.name, name: row.student_name || row.name }
+  editForm.value = { ...studentRow, student_name: studentRow.student_name || studentRow.name, name: studentRow.student_name || studentRow.name }
   editDialogVisible.value = true
 }
 
+/**
+ * 提交学生新增/编辑。
+ * 姓名为空或未选班级时给出提示并中断；写库时同步维护 student_name 与 name 两个字段。
+ * @returns 无返回值，成功后关闭弹窗并刷新学生列表
+ */
 async function handleSubmitStudent() {
   try {
     await editFormRef.value?.validate()
   } catch {
+    // 表单校验未通过（Element Plus 已给出提示），直接中断提交
     return
   }
   const student_name = editForm.value.student_name?.trim() || editForm.value.name?.trim()
@@ -174,28 +208,34 @@ async function handleSubmitStudent() {
     }
     editDialogVisible.value = false
     await loadStudents()
-  } catch (err: any) {
-    ElMessage.error(err.message || '保存失败')
+  } catch (err: unknown) {
+    ElMessage.error(err instanceof Error && err.message ? err.message : '保存失败')
   }
 }
 
-async function handleDeleteStudent(row: StudentRow) {
+/**
+ * 删除学生：先二次确认，再删除 students 记录。
+ * @param studentRow 被删除的学生行
+ * @returns 无返回值，成功后刷新学生列表
+ */
+async function handleDeleteStudent(studentRow: StudentRow) {
   try {
     await ElMessageBox.confirm(
-      `确定删除学生「${row.student_name || row.name}」吗？`,
+      `确定删除学生「${studentRow.student_name || studentRow.name}」吗？`,
       '提示',
       { type: 'warning' },
     )
   } catch {
+    // 用户在确认框点了取消，不执行删除
     return
   }
   try {
-    const { error } = await supabase.from('students').delete().eq('id', row.id)
+    const { error } = await supabase.from('students').delete().eq('id', studentRow.id)
     if (error) throw error
     ElMessage.success('删除成功')
     await loadStudents()
-  } catch (err: any) {
-    ElMessage.error(err.message || '删除失败')
+  } catch (err: unknown) {
+    ElMessage.error(err instanceof Error && err.message ? err.message : '删除失败')
   }
 }
 
@@ -225,7 +265,7 @@ onMounted(async () => {
       </el-form-item>
       <el-form-item label="班级">
         <el-select v-model="filterClassId" placeholder="全部班级" clearable style="width: 180px">
-          <el-option v-for="c in classes" :key="c.id" :label="c.name" :value="c.id" />
+          <el-option v-for="classOption in classes" :key="classOption.id" :label="classOption.name" :value="classOption.id" />
         </el-select>
       </el-form-item>
       <el-form-item>
@@ -281,7 +321,7 @@ onMounted(async () => {
           :rules="[{ required: true, message: '请选择班级', trigger: 'change' }]"
         >
           <el-select v-model="editForm.class_id" placeholder="请选择班级" style="width: 100%">
-            <el-option v-for="c in classes" :key="c.id" :label="c.name" :value="c.id" />
+            <el-option v-for="classOption in classes" :key="classOption.id" :label="classOption.name" :value="classOption.id" />
           </el-select>
         </el-form-item>
       </el-form>

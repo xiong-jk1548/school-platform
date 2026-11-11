@@ -22,6 +22,11 @@ const loading = ref(false)
 const logs = ref<LogRow[]>([])
 const dateRange = ref<[string, string] | null>(null)
 
+/**
+ * 加载当前登录教师本人的积分操作流水（最多 500 条，可按时间范围过滤）
+ * 流水表只存了 student_id，这里再批量查学生与班级，回填 student_name / class_name
+ * @returns 无返回值（副作用：写入 logs，并在 finally 中复位 loading）
+ */
 async function loadLogs() {
   if (!userStore.id) return
   loading.value = true
@@ -35,54 +40,59 @@ async function loadLogs() {
       const [start, end] = dateRange.value
       query = query.gte('created_at', start).lte('created_at', end)
     }
-    const { data, error } = await query.limit(500)
+    const { data: logRows, error } = await query.limit(500)
     if (error) throw error
-    const rows = (data ?? []) as LogRow[]
+    const logList = (logRows ?? []) as LogRow[]
 
-    const studentIds = Array.from(new Set(rows.map((r) => r.student_id).filter(Boolean)))
+    const studentIds = Array.from(new Set(logList.map((log) => log.student_id).filter(Boolean)))
     if (studentIds.length > 0) {
-      const { data: stuRes, error: stuErr } = await supabase
+      const { data: studentRows, error: studentError } = await supabase
         .from('students')
         .select('id, name, class_id')
         .in('id', studentIds)
-      if (stuErr) throw stuErr
+      if (studentError) throw studentError
 
       const classIds = Array.from(
-        new Set(((stuRes ?? []) as any[]).map((s) => s.class_id).filter(Boolean)),
+        new Set(((studentRows ?? []) as any[]).map((student) => student.class_id).filter(Boolean)),
       )
-      let classesMap: Record<string, string> = {}
+      let classNamesById: Record<string, string> = {}
       if (classIds.length > 0) {
-        const { data: classRes } = await supabase.from('classes').select('id, name').in('id', classIds)
-        classesMap = Object.fromEntries(((classRes ?? []) as any[]).map((c) => [c.id, c.name]))
+        const { data: classRows } = await supabase.from('classes').select('id, name').in('id', classIds)
+        classNamesById = Object.fromEntries(((classRows ?? []) as any[]).map((classRow) => [classRow.id, classRow.name]))
       }
 
-      const stuMap = Object.fromEntries(
-        ((stuRes ?? []) as any[]).map((s: any) => [s.id, s]),
+      const studentsById = Object.fromEntries(
+        ((studentRows ?? []) as any[]).map((student: any) => [student.id, student]),
       )
-      for (const r of rows) {
-        const stu = stuMap[r.student_id]
-        r.student_name = stu?.name ?? '-'
-        r.class_name = stu?.class_id ? classesMap[stu.class_id] ?? '-' : '-'
+      for (const log of logList) {
+        const student = studentsById[log.student_id]
+        log.student_name = student?.name ?? '-'
+        log.class_name = student?.class_id ? classNamesById[student.class_id] ?? '-' : '-'
       }
     }
-    logs.value = rows
-  } catch (err: any) {
-    ElMessage.error(err.message || '加载操作流水失败')
+    logs.value = logList
+  } catch (err: unknown) {
+    ElMessage.error(err instanceof Error && err.message ? err.message : '加载操作流水失败')
   } finally {
     loading.value = false
   }
 }
 
+// 把流水记录转换成导出用的中文表头行数据
 const exportRows = computed(() =>
-  logs.value.map((r) => ({
-    学生: r.student_name ?? '',
-    班级: r.class_name ?? '',
-    变动值: r.score ?? 0,
-    备注: r.remark ?? '',
-    时间: r.created_at ?? '',
+  logs.value.map((log) => ({
+    学生: log.student_name ?? '',
+    班级: log.class_name ?? '',
+    变动值: log.score ?? 0,
+    备注: log.remark ?? '',
+    时间: log.created_at ?? '',
   })),
 )
 
+/**
+ * 导出当前筛选结果中的操作流水为 Excel
+ * @returns 无返回值（副作用：下载 xlsx 文件；无数据时仅提示不导出）
+ */
 function handleExport() {
   if (exportRows.value.length === 0) {
     ElMessage.warning('暂无可导出的数据')
@@ -124,14 +134,14 @@ onMounted(loadLogs)
       <el-table-column prop="student_name" label="学生" min-width="120" />
       <el-table-column prop="class_name" label="班级" min-width="140" />
       <el-table-column label="变动值" min-width="100">
-        <template #default="{ row }">
-          <el-tag :type="(row.score ?? 0) >= 0 ? 'success' : 'danger'">
-            {{ row.score && row.score > 0 ? '+' : '' }}{{ row.score ?? 0 }}
+        <template #default="{ row: logRow }">
+          <el-tag :type="(logRow.score ?? 0) >= 0 ? 'success' : 'danger'">
+            {{ logRow.score && logRow.score > 0 ? '+' : '' }}{{ logRow.score ?? 0 }}
           </el-tag>
         </template>
       </el-table-column>
       <el-table-column prop="remark" label="备注" min-width="200">
-        <template #default="{ row }">{{ row.remark || '-' }}</template>
+        <template #default="{ row: logRow }">{{ logRow.remark || '-' }}</template>
       </el-table-column>
       <el-table-column prop="created_at" label="时间" min-width="180" />
     </el-table>

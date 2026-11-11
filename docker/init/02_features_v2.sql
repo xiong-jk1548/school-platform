@@ -1,154 +1,69 @@
 -- ============================================================
--- V2 增量脚本 —— 作业管理 + 物品借阅
--- 升级时执行（已部署过 V1 的数据库跑这个）
--- 全部使用 IF NOT EXISTS，可重复安全重跑
+-- V2 增量脚本 —— 作业管理 + 物品借阅（补充索引与借阅触发器）
+-- ============================================================
+-- 【本次清理说明】
+--   本文件原先重复 CREATE 了以下四张表，且列名与 01_schema.sql 中的版本不一致：
+--       homework_subjects  : subject_name/name vs subject_name（缺 name、created_at）
+--       homework_records   : 缺 create_time / created_at
+--       borrow_items       : total_qty/available_qty/location vs total_quantity/available_quantity
+--       borrow_records     : BIGSERIAL 主键、qty/borrow_time/return_time vs UUID 主键、borrow_date
+--   两边都是 CREATE TABLE IF NOT EXISTS，而 01_schema.sql 按文件名顺序先执行，
+--   所以实际生效的一直是 01 那一版 —— 本文件的建表语句属于永远不生效的死代码，
+--   却让人误以为库里存在"第二套列"。现以 01_schema.sql 为唯一权威定义，删除重复建表。
+--
+--   同时删除的还有这四张表的 RLS 策略：09_school_isolation_rls.sql 开头有一个 DO 块，
+--   会把所有"USING 子句里查询过 profiles"的旧策略一次性 DROP（避免策略自引用触发
+--   "infinite recursion detected in policy"）。因此这里的策略建完就会被删掉，
+--   只留下"建了又删"的噪声。这四张表的 RLS 统一由 09 号脚本定义。
+--
+-- 本文件现在只保留两样 01_schema.sql 未覆盖的内容：
+--   1. 补充索引
+--   2. 借阅可用数量维护触发器
+--
+-- 全部使用 IF NOT EXISTS / CREATE OR REPLACE，可重复安全重跑
 -- 执行方式：
 --   docker exec -i supabase-db psql -U supabase -d postgres < 02_features_v2.sql
 -- ============================================================
 
 -- ---------------------- 模块一：作业完成情况管理 ----------------------
+-- 表结构见 01_schema.sql 第 6~8 节：
+--   homework_subjects（科目配置） / homework_records（每生每科每天完成情况） / homework_notes（当日作业内容）
 
--- 1. 科目表：学校级别的科目配置
-CREATE TABLE IF NOT EXISTS public.homework_subjects (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    school_id UUID NOT NULL REFERENCES public.schools(id) ON DELETE CASCADE,
-    subject_name TEXT NOT NULL,
-    sort_order INT NOT NULL DEFAULT 0,
-    create_time TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE(school_id, subject_name)
-);
-
+-- 科目表按学校查询的支撑索引
 CREATE INDEX IF NOT EXISTS idx_hw_subject_school ON public.homework_subjects(school_id);
 
-ALTER TABLE public.homework_subjects ENABLE ROW LEVEL SECURITY;
-
-CREATE POLICY IF NOT EXISTS policy_hw_subject_sys_read ON public.homework_subjects
-FOR SELECT TO authenticated
-USING ((SELECT role FROM public.profiles WHERE id=auth.uid())='sys_admin');
-
-CREATE POLICY IF NOT EXISTS policy_hw_subject_school_admin ON public.homework_subjects
-FOR ALL TO authenticated
-USING ((SELECT role FROM public.profiles WHERE id=auth.uid())='school_admin'
-       AND homework_subjects.school_id = (SELECT school_id FROM public.profiles WHERE id=auth.uid()));
-
-CREATE POLICY IF NOT EXISTS policy_hw_subject_teacher_read ON public.homework_subjects
-FOR SELECT TO authenticated
-USING ((SELECT role FROM public.profiles WHERE id=auth.uid())='teacher'
-       AND homework_subjects.school_id = (SELECT school_id FROM public.profiles WHERE id=auth.uid()));
-
--- 2. 作业完成记录表：每生每科目每天一条
-CREATE TABLE IF NOT EXISTS public.homework_records (
-    id BIGSERIAL PRIMARY KEY,
-    school_id UUID NOT NULL REFERENCES public.schools(id) ON DELETE CASCADE,
-    class_id UUID NOT NULL REFERENCES public.classes(id) ON DELETE CASCADE,
-    student_id UUID NOT NULL REFERENCES public.students(id) ON DELETE CASCADE,
-    subject_id UUID NOT NULL REFERENCES public.homework_subjects(id) ON DELETE CASCADE,
-    record_date DATE NOT NULL DEFAULT CURRENT_DATE,
-    is_done BOOLEAN NOT NULL DEFAULT FALSE,
-    remark TEXT,
-    update_user_id UUID REFERENCES auth.users(id),
-    update_time TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE(student_id, subject_id, record_date)
-);
-
-CREATE INDEX IF NOT EXISTS idx_hw_record_class_date ON public.homework_records(class_id, record_date);
+-- 作业完成记录按学生查询
+-- （按班级+日期查询的索引已在 01_schema.sql 中建为 idx_hw_records_class_date）
 CREATE INDEX IF NOT EXISTS idx_hw_record_student ON public.homework_records(student_id);
 
-ALTER TABLE public.homework_records ENABLE ROW LEVEL SECURITY;
-
-CREATE POLICY IF NOT EXISTS policy_hw_record_sys_read ON public.homework_records
-FOR SELECT TO authenticated
-USING ((SELECT role FROM public.profiles WHERE id=auth.uid())='sys_admin');
-
-CREATE POLICY IF NOT EXISTS policy_hw_record_school_admin ON public.homework_records
-FOR ALL TO authenticated
-USING ((SELECT role FROM public.profiles WHERE id=auth.uid())='school_admin'
-       AND homework_records.school_id = (SELECT school_id FROM public.profiles WHERE id=auth.uid()));
-
-CREATE POLICY IF NOT EXISTS policy_hw_record_teacher ON public.homework_records
-FOR ALL TO authenticated
-USING ((SELECT role FROM public.profiles WHERE id=auth.uid())='teacher'
-       AND homework_records.class_id = (SELECT class_id FROM public.profiles WHERE id=auth.uid()));
-
 -- ---------------------- 模块二：班级公共物品借阅登记 ----------------------
+-- 表结构见 01_schema.sql 第 9~10 节：
+--   borrow_items（班级物品台账） / borrow_records（借还流水）
 
--- 1. 物品表：班级级别的物品库
-CREATE TABLE IF NOT EXISTS public.borrow_items (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    school_id UUID NOT NULL REFERENCES public.schools(id) ON DELETE CASCADE,
-    class_id UUID NOT NULL REFERENCES public.classes(id) ON DELETE CASCADE,
-    item_name TEXT NOT NULL,
-    total_qty INT NOT NULL DEFAULT 1,
-    available_qty INT NOT NULL DEFAULT 1,
-    location TEXT,
-    remark TEXT,
-    create_time TIMESTAMPTZ NOT NULL DEFAULT now(),
-    CHECK (available_qty >= 0),
-    CHECK (available_qty <= total_qty)
-);
-
+-- 物品台账按班级查询
 CREATE INDEX IF NOT EXISTS idx_borrow_item_class ON public.borrow_items(class_id);
 
-ALTER TABLE public.borrow_items ENABLE ROW LEVEL SECURITY;
-
-CREATE POLICY IF NOT EXISTS policy_borrow_item_sys_read ON public.borrow_items
-FOR SELECT TO authenticated
-USING ((SELECT role FROM public.profiles WHERE id=auth.uid())='sys_admin');
-
-CREATE POLICY IF NOT EXISTS policy_borrow_item_school_admin ON public.borrow_items
-FOR ALL TO authenticated
-USING ((SELECT role FROM public.profiles WHERE id=auth.uid())='school_admin'
-       AND borrow_items.school_id = (SELECT school_id FROM public.profiles WHERE id=auth.uid()));
-
-CREATE POLICY IF NOT EXISTS policy_borrow_item_teacher ON public.borrow_items
-FOR ALL TO authenticated
-USING ((SELECT role FROM public.profiles WHERE id=auth.uid())='teacher'
-       AND borrow_items.class_id = (SELECT class_id FROM public.profiles WHERE id=auth.uid()));
-
--- 2. 借还记录表
-CREATE TABLE IF NOT EXISTS public.borrow_records (
-    id BIGSERIAL PRIMARY KEY,
-    school_id UUID NOT NULL REFERENCES public.schools(id) ON DELETE CASCADE,
-    class_id UUID NOT NULL REFERENCES public.classes(id) ON DELETE CASCADE,
-    item_id UUID NOT NULL REFERENCES public.borrow_items(id) ON DELETE CASCADE,
-    student_id UUID NOT NULL REFERENCES public.students(id) ON DELETE CASCADE,
-    qty INT NOT NULL DEFAULT 1,
-    status TEXT NOT NULL DEFAULT 'borrowed', -- borrowed / returned
-    borrow_time TIMESTAMPTZ NOT NULL DEFAULT now(),
-    return_time TIMESTAMPTZ,
-    operator_user_id UUID NOT NULL REFERENCES auth.users(id),
-    remark TEXT
-);
-
-CREATE INDEX IF NOT EXISTS idx_borrow_record_item ON public.borrow_records(item_id);
+-- 借阅流水按学生 / 按班级查询
+-- （按物品查询的索引已在 01_schema.sql 中建为 idx_borrow_records_item）
 CREATE INDEX IF NOT EXISTS idx_borrow_record_student ON public.borrow_records(student_id);
-CREATE INDEX IF NOT EXISTS idx_borrow_record_class ON public.borrow_records(class_id);
+CREATE INDEX IF NOT EXISTS idx_borrow_record_class   ON public.borrow_records(class_id);
 
-ALTER TABLE public.borrow_records ENABLE ROW LEVEL SECURITY;
-
-CREATE POLICY IF NOT EXISTS policy_borrow_record_sys_read ON public.borrow_records
-FOR SELECT TO authenticated
-USING ((SELECT role FROM public.profiles WHERE id=auth.uid())='sys_admin');
-
-CREATE POLICY IF NOT EXISTS policy_borrow_record_school_admin ON public.borrow_records
-FOR ALL TO authenticated
-USING ((SELECT role FROM public.profiles WHERE id=auth.uid())='school_admin'
-       AND borrow_records.school_id = (SELECT school_id FROM public.profiles WHERE id=auth.uid()));
-
-CREATE POLICY IF NOT EXISTS policy_borrow_record_teacher ON public.borrow_records
-FOR ALL TO authenticated
-USING ((SELECT role FROM public.profiles WHERE id=auth.uid())='teacher'
-       AND borrow_records.class_id = (SELECT class_id FROM public.profiles WHERE id=auth.uid()));
-
--- 3. 物品可用数量自动维护触发器
+-- 物品可用数量自动维护触发器
+--   借出：INSERT status='borrowed'             → available_quantity -= qty
+--   归还：UPDATE status 由 borrowed 改为 returned → available_quantity += qty
+--
+-- 【列名变更记录】本函数曾误用 02 版旧列名 available_qty / NEW.qty，而运行库里的列
+--   实际叫 available_quantity、且借阅记录里当时根本没有 qty 列，导致每一次借出登记都抛
+--   "ERROR: column \"available_qty\" does not exist"，借阅功能从未成功写入过一条记录
+--   （borrow_records 长期为 0 行）。现改为与 01_schema.sql 一致的列名。
 CREATE OR REPLACE FUNCTION public.fn_update_borrow_available()
 RETURNS TRIGGER AS $$
 BEGIN
     IF TG_OP = 'INSERT' AND NEW.status = 'borrowed' THEN
-        UPDATE public.borrow_items SET available_qty = available_qty - NEW.qty
-        WHERE id = NEW.item_id AND available_qty >= NEW.qty;
+        UPDATE public.borrow_items SET available_quantity = available_quantity - NEW.qty
+        WHERE id = NEW.item_id AND available_quantity >= NEW.qty;
     ELSIF TG_OP = 'UPDATE' AND OLD.status = 'borrowed' AND NEW.status = 'returned' THEN
-        UPDATE public.borrow_items SET available_qty = available_qty + NEW.qty
+        UPDATE public.borrow_items SET available_quantity = available_quantity + NEW.qty
         WHERE id = NEW.item_id;
     END IF;
     RETURN NEW;

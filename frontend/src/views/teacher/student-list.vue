@@ -38,30 +38,39 @@ const editForm = ref<StudentRow>({
 // 积分弹窗
 const scoreDialogRef = ref<InstanceType<typeof ScoreDialog> | null>(null)
 
+/**
+ * 加载本班学生列表，并兼容 name 字段补齐 student_name
+ * @returns 无返回值（副作用：写入 students，并在 finally 中复位 loading）
+ */
 async function loadStudents() {
   if (!userStore.classId) return
   loading.value = true
   try {
-    const { data, error } = await supabase
+    const { data: studentRows, error } = await supabase
       .from('students')
       .select('*')
       .eq('class_id', userStore.classId)
       .order('student_name', { ascending: true })
     if (error) throw error
 
-    const rows = (data ?? []) as StudentRow[]
-    rows.forEach((s: any) => {
-      if (!s.student_name && s.name) s.student_name = s.name
+    const studentList = (studentRows ?? []) as StudentRow[]
+    studentList.forEach((student: any) => {
+      if (!student.student_name && student.name) student.student_name = student.name
     })
-    students.value = rows
-  } catch (err: any) {
-    ElMessage.error(err.message || '加载学生列表失败')
+    students.value = studentList
+  } catch (err: unknown) {
+    ElMessage.error(err instanceof Error && err.message ? err.message : '加载学生列表失败')
   } finally {
     loading.value = false
   }
 }
 
 // ===== 学生 CRUD =====
+
+/**
+ * 打开「新增学生」弹窗，并把表单重置为空白状态
+ * @returns 无返回值（副作用：复位 editForm 与 editIsEdit，打开弹窗）
+ */
 function openAddStudent() {
   editIsEdit.value = false
   editForm.value = {
@@ -74,16 +83,27 @@ function openAddStudent() {
   editDialogVisible.value = true
 }
 
-function openEditStudent(row: StudentRow) {
+/**
+ * 打开「编辑学生」弹窗，并用当前行数据回填表单
+ * @param student 表格当前行对应的学生记录
+ * @returns 无返回值（副作用：回填 editForm，打开弹窗）
+ */
+function openEditStudent(student: StudentRow) {
   editIsEdit.value = true
-  editForm.value = { ...row, name: row.student_name }
+  editForm.value = { ...student, name: student.student_name }
   editDialogVisible.value = true
 }
 
+/**
+ * 提交学生新增/编辑表单
+ * 先做表单校验，再按 editIsEdit 决定走 update 还是 insert，成功后关闭弹窗并刷新列表
+ * @returns 无返回值（副作用：写入 students 表、关闭弹窗、重新加载列表）
+ */
 async function handleSubmitStudent() {
   try {
     await editFormRef.value?.validate()
   } catch {
+    // 校验未通过时直接返回，具体错误提示由 el-form 的表单规则自行展示
     return
   }
   const student_name = editForm.value.student_name.trim()
@@ -117,144 +137,178 @@ async function handleSubmitStudent() {
     }
     editDialogVisible.value = false
     await loadStudents()
-  } catch (err: any) {
-    ElMessage.error(err.message || '保存失败')
+  } catch (err: unknown) {
+    ElMessage.error(err instanceof Error && err.message ? err.message : '保存失败')
   }
 }
 
-async function handleDeleteStudent(row: StudentRow) {
+/**
+ * 删除指定学生
+ * 先弹确认框（用户取消则直接返回），确认后删除该学生并刷新列表
+ * @param student 要删除的学生记录
+ * @returns 无返回值（副作用：删除 students 表中的记录、重新加载列表）
+ */
+async function handleDeleteStudent(student: StudentRow) {
   try {
-    await ElMessageBox.confirm(`确定删除学生「${row.student_name || row.name}」吗？`, '提示', {
+    await ElMessageBox.confirm(`确定删除学生「${student.student_name || student.name}」吗？`, '提示', {
       type: 'warning',
     })
   } catch {
+    // 用户点了取消或关闭确认框，属于正常操作，无需提示
     return
   }
   try {
-    const { error } = await supabase.from('students').delete().eq('id', row.id)
+    const { error } = await supabase.from('students').delete().eq('id', student.id)
     if (error) throw error
     ElMessage.success('删除成功')
     await loadStudents()
-  } catch (err: any) {
-    ElMessage.error(err.message || '删除失败')
+  } catch (err: unknown) {
+    ElMessage.error(err instanceof Error && err.message ? err.message : '删除失败')
   }
 }
 
 // ===== 积分操作 =====
-function openScoreDialog(row: StudentRow, type: 'add' | 'deduct') {
-  scoreDialogRef.value?.open(row, type)
+
+/**
+ * 打开学生积分变动弹窗（加分/扣分）
+ * @param student 被操作的学生记录
+ * @param type 操作类型：add 加分 / deduct 扣分
+ * @returns 无返回值（副作用：调用子组件 ScoreDialog 的 open 方法）
+ */
+function openScoreDialog(student: StudentRow, type: 'add' | 'deduct') {
+  scoreDialogRef.value?.open(student, type)
 }
 
 // ===== 导出 =====
+
+/**
+ * 导出当前班级的学生名单（姓名、学号、总积分）为 Excel
+ * @returns 无返回值（副作用：下载 xlsx 文件；无数据时仅提示不导出）
+ */
 function handleExport() {
   if (students.value.length === 0) {
     ElMessage.warning('暂无学生数据可导出')
     return
   }
-  const header = ['学生姓名', '学号', '总积分']
-  const body = students.value.map((s) => [
-    s.student_name || s.name || '',
-    s.student_no || '',
-    s.total_score ?? 0,
+  const headerCells = ['学生姓名', '学号', '总积分']
+  const bodyRows = students.value.map((student) => [
+    student.student_name || student.name || '',
+    student.student_no || '',
+    student.total_score ?? 0,
   ])
-  exportToExcel([header, ...body], `学生管理_${userStore.className || ''}_${Date.now()}.xlsx`)
+  exportToExcel([headerCells, ...bodyRows], `学生管理_${userStore.className || ''}_${Date.now()}.xlsx`)
 }
 
 // ===== 模板下载 =====
+
+/**
+ * 下载批量导入用的 Excel 模板（含示例数据）
+ * @returns 无返回值（副作用：下载 xlsx 模板文件并提示用户）
+ */
 function downloadTemplate() {
-  const template = [
+  const templateRows = [
     ['学生姓名', '学号'],
     ['张伟', '202401'],
     ['李娜', '202402'],
   ]
-  exportToExcel(template, `学生导入模板_${Date.now()}.xlsx`)
+  exportToExcel(templateRows, `学生导入模板_${Date.now()}.xlsx`)
   ElMessage.success('模板已下载，填写后可批量导入')
 }
 
 // ===== 导入 =====
+
+/**
+ * 触发隐藏的文件选择框，供用户选择要导入的 Excel 文件
+ * @returns 无返回值（副作用：清空 input 并触发点击）
+ */
 function handleImportClick() {
-  const el = document.getElementById('student-import-file') as HTMLInputElement
-  el.value = ''
-  el.click()
+  const fileInput = document.getElementById('student-import-file') as HTMLInputElement
+  fileInput.value = ''
+  fileInput.click()
 }
 
-async function handleFileChange(e: Event) {
-  const input = e.target as HTMLInputElement
-  const file = input.files?.[0]
+/**
+ * 处理导入文件选择：解析 Excel 并做按姓名 upsert（已存在则更新学号，不存在则新增）
+ * @param changeEvent 文件 input 的 change 事件，用于取到用户选中的文件
+ * @returns 无返回值（副作用：写入/更新 students 表、提示导入结果、重新加载列表）
+ */
+async function handleFileChange(changeEvent: Event) {
+  const fileInput = changeEvent.target as HTMLInputElement
+  const file = fileInput.files?.[0]
   if (!file) return
   try {
-    const buf = await file.arrayBuffer()
-    const wb = XLSX.read(buf, { type: 'array' })
-    const ws = wb.Sheets[wb.SheetNames[0]]
-    const rows = XLSX.utils.sheet_to_json<any>(ws, { header: 1 })
-    if (rows.length < 2) {
+    const fileBuffer = await file.arrayBuffer()
+    const workbook = XLSX.read(fileBuffer, { type: 'array' })
+    const worksheet = workbook.Sheets[workbook.SheetNames[0]]
+    const sheetRows = XLSX.utils.sheet_to_json<any>(worksheet, { header: 1 })
+    if (sheetRows.length < 2) {
       ElMessage.warning('Excel 内容为空或只有表头')
       return
     }
 
     // 解析：识别表头（第一行找"姓名"或"学生姓名"）
-    const header = rows[0].map((h: any) => String(h ?? '').trim())
-    const nameIdx = header.findIndex((h: string) => h.includes('姓名'))
-    const noIdx = header.findIndex((h: string) => h.includes('学号'))
+    const headerCells = sheetRows[0].map((cellText: any) => String(cellText ?? '').trim())
+    const nameIdx = headerCells.findIndex((cellText: string) => cellText.includes('姓名'))
+    const noIdx = headerCells.findIndex((cellText: string) => cellText.includes('学号'))
     if (nameIdx < 0) {
       ElMessage.error('Excel 需包含"姓名"或"学生姓名"列')
       return
     }
 
     // upsert
-    const existingMap = new Map<string, StudentRow>()
-    students.value.forEach((s) => {
-      if (s.student_name) existingMap.set(s.student_name.trim(), s)
+    const studentsByName = new Map<string, StudentRow>()
+    students.value.forEach((student) => {
+      if (student.student_name) studentsByName.set(student.student_name.trim(), student)
     })
 
-    let inserted = 0, updated = 0, skipped = 0
-    const insertBatch: any[] = []
-    const updateBatch: { id: string; patch: any }[] = []
+    let insertedCount = 0, updatedCount = 0, skippedCount = 0
+    const studentsToInsert: any[] = []
+    const studentsToUpdate: { id: string; patch: any }[] = []
 
-    for (let i = 1; i < rows.length; i++) {
-      const r = rows[i]
-      const name = String(r[nameIdx] ?? '').trim()
-      if (!name) continue
-      const no = noIdx >= 0 ? String(r[noIdx] ?? '').trim() : ''
+    for (let rowIndex = 1; rowIndex < sheetRows.length; rowIndex++) {
+      const sheetRow = sheetRows[rowIndex]
+      const studentName = String(sheetRow[nameIdx] ?? '').trim()
+      if (!studentName) continue
+      const studentNo = noIdx >= 0 ? String(sheetRow[noIdx] ?? '').trim() : ''
 
-      const exist = existingMap.get(name)
-      if (exist) {
-        if (exist.student_no !== no) {
-          updateBatch.push({
-            id: exist.id,
-            patch: { student_no: no || null },
+      const existingStudent = studentsByName.get(studentName)
+      if (existingStudent) {
+        if (existingStudent.student_no !== studentNo) {
+          studentsToUpdate.push({
+            id: existingStudent.id,
+            patch: { student_no: studentNo || null },
           })
-          updated++
+          updatedCount++
         } else {
-          skipped++
+          skippedCount++
         }
       } else {
-        insertBatch.push({
-          student_name: name,
-          name: name,
-          student_no: no || null,
+        studentsToInsert.push({
+          student_name: studentName,
+          name: studentName,
+          student_no: studentNo || null,
           class_id: userStore.classId!,
           school_id: userStore.schoolId || null,
           total_score: 0,
         })
-        inserted++
+        insertedCount++
       }
     }
 
     // 逐个 upsert（mock 层不支持 batch）
-    for (const item of insertBatch) {
-      const { error } = await supabase.from('students').insert(item)
+    for (const newStudent of studentsToInsert) {
+      const { error } = await supabase.from('students').insert(newStudent)
       if (error) throw error
     }
-    for (const u of updateBatch) {
-      const { error } = await supabase.from('students').update(u.patch).eq('id', u.id)
+    for (const updateItem of studentsToUpdate) {
+      const { error } = await supabase.from('students').update(updateItem.patch).eq('id', updateItem.id)
       if (error) throw error
     }
 
-    ElMessage.success(`导入完成：新增 ${inserted} 人，更新 ${updated} 人，跳过 ${skipped} 人`)
+    ElMessage.success(`导入完成：新增 ${insertedCount} 人，更新 ${updatedCount} 人，跳过 ${skippedCount} 人`)
     await loadStudents()
-  } catch (err: any) {
-    ElMessage.error(err.message || '导入失败')
+  } catch (err: unknown) {
+    ElMessage.error(err instanceof Error && err.message ? err.message : '导入失败')
   }
 }
 
@@ -279,24 +333,24 @@ onMounted(loadStudents)
 
     <el-table :data="students" v-loading="loading" stripe style="width: 100%">
       <el-table-column prop="student_name" label="姓名" min-width="120">
-        <template #default="{ row }">{{ row.student_name || row.name }}</template>
+        <template #default="{ row: studentRow }">{{ studentRow.student_name || studentRow.name }}</template>
       </el-table-column>
       <el-table-column prop="student_no" label="学号" min-width="140">
-        <template #default="{ row }">{{ row.student_no || '-' }}</template>
+        <template #default="{ row: studentRow }">{{ studentRow.student_no || '-' }}</template>
       </el-table-column>
       <el-table-column label="总积分" min-width="120">
-        <template #default="{ row }">
-          <el-tag :type="(row.total_score ?? 0) >= 0 ? 'success' : 'danger'">
-            {{ row.total_score ?? 0 }}
+        <template #default="{ row: studentRow }">
+          <el-tag :type="(studentRow.total_score ?? 0) >= 0 ? 'success' : 'danger'">
+            {{ studentRow.total_score ?? 0 }}
           </el-tag>
         </template>
       </el-table-column>
       <el-table-column label="操作" width="280" fixed="right">
-        <template #default="{ row }">
-          <el-button link type="success" @click="openScoreDialog(row as StudentRow, 'add')">加分</el-button>
-          <el-button link type="danger" @click="openScoreDialog(row as StudentRow, 'deduct')">扣分</el-button>
-          <el-button link type="primary" :icon="Edit" @click="openEditStudent(row as StudentRow)" />
-          <el-button link type="danger" :icon="Delete" @click="handleDeleteStudent(row as StudentRow)" />
+        <template #default="{ row: studentRow }">
+          <el-button link type="success" @click="openScoreDialog(studentRow as StudentRow, 'add')">加分</el-button>
+          <el-button link type="danger" @click="openScoreDialog(studentRow as StudentRow, 'deduct')">扣分</el-button>
+          <el-button link type="primary" :icon="Edit" @click="openEditStudent(studentRow as StudentRow)" />
+          <el-button link type="danger" :icon="Delete" @click="handleDeleteStudent(studentRow as StudentRow)" />
         </template>
       </el-table-column>
     </el-table>

@@ -22,40 +22,50 @@ const confettiPieces = ref<Array<{ id: number; left: number; delay: number; colo
 
 let rafId: number | null = null
 
+/**
+ * 加载本班学生作为转盘扇区数据源，并兼容 name 字段补齐 student_name
+ * @returns 无返回值，成功后写入 students 列表
+ */
 async function loadStudents() {
   if (!userStore.classId) return
   try {
-    const { data } = await supabase
+    const { data: studentRows } = await supabase
       .from('students')
       .select('*')
       .eq('class_id', userStore.classId)
       .order('student_name', { ascending: true })
-    const rows = (data ?? []) as StudentRow[]
-    rows.forEach((s: any) => {
-      if (!s.student_name && s.name) s.student_name = s.name
+    const studentList = (studentRows ?? []) as StudentRow[]
+    studentList.forEach((student: any) => {
+      if (!student.student_name && student.name) student.student_name = student.name
     })
-    students.value = rows
-  } catch (err: any) {
-    ElMessage.error(err.message || '加载失败')
+    students.value = studentList
+  } catch (err: unknown) {
+    ElMessage.error(err instanceof Error && err.message ? err.message : '加载失败')
   }
 }
 
+// 可参与本轮抽取的候选名单（开启「不重复抽」时剔除已抽过的学生）
 const pool = computed(() => {
   if (!excludePicked.value) return students.value
   if (history.value.length === 0) return students.value
-  return students.value.filter((s) => !history.value.includes(s.student_name))
+  return students.value.filter((student) => !history.value.includes(student.student_name))
 })
 
 // 每个扇形的角度
 const sliceAngle = computed(() => {
-  const n = students.value.length
-  return n > 0 ? 360 / n : 0
+  const studentTotal = students.value.length
+  return studentTotal > 0 ? 360 / studentTotal : 0
 })
 
 // 转盘扇形颜色（交替）
 const sliceColors = ['#2B5CE6', '#F59E0B', '#10B981', '#8B5CF6', '#EF4444', '#06B6D4', '#EC4899', '#84CC16']
 
 // ==== 核心：RAF 转盘动画 ====
+/**
+ * 开始一次随机抽取：先随机确定中奖学生并计算目标角度，再用 requestAnimationFrame 逐帧播放减速动画
+ * 动画结束后固定指针角度、写入点名历史并撒花提示
+ * @returns 无返回值（副作用：驱动 wheelAngle/displayName/finalPicked 等响应式状态）
+ */
 function startPick() {
   if (spinning.value) return
   if (students.value.length === 0) {
@@ -72,18 +82,18 @@ function startPick() {
   confettiPieces.value = []
 
   // 选最终目标
-  const pick = pool.value[Math.floor(Math.random() * pool.value.length)]
-  const finalName = pick.student_name
-  const finalIdx = students.value.findIndex((s) => s.student_name === finalName)
+  const pickedStudent = pool.value[Math.floor(Math.random() * pool.value.length)]
+  const finalName = pickedStudent.student_name
+  const finalIdx = students.value.findIndex((student) => student.student_name === finalName)
 
   // 目标角度：当前角度 + 5-8 圈 + 指向目标扇形中心的偏移
-  const currentMod = ((wheelAngle.value % 360) + 360) % 360
+  const angleModAtStart = ((wheelAngle.value % 360) + 360) % 360
   // 指针在顶部（0°），转盘顺时针转，所以角度增加时，对应的扇形索引 = floor(((360 - currentAngle + 360) % 360) / sliceAngle)
   // 让指针指向目标扇形中心：
   const targetOffset = 360 - (finalIdx * sliceAngle.value + sliceAngle.value / 2)
   const randomJitter = (Math.random() - 0.5) * (sliceAngle.value * 0.6) // 小抖动增加真实感
   const fullTurns = 6 + Math.floor(Math.random() * 3) // 6-8 圈
-  const targetAngle = wheelAngle.value + (fullTurns * 360) + (targetOffset - currentMod) + randomJitter
+  const targetAngle = wheelAngle.value + (fullTurns * 360) + (targetOffset - angleModAtStart) + randomJitter
 
   // 动画参数
   const duration = 3000 // 3 秒
@@ -91,23 +101,23 @@ function startPick() {
   const startTime = performance.now()
 
   // easing: easeOutQuart（强减速）
-  function easeOutQuart(t: number): number {
-    return 1 - Math.pow(1 - t, 4)
+  function easeOutQuart(progress: number): number {
+    return 1 - Math.pow(1 - progress, 4)
   }
 
-  function frame(now: number) {
-    const elapsed = now - startTime
-    const t = Math.min(1, elapsed / duration)
-    const eased = easeOutQuart(t)
+  function frame(timestamp: number) {
+    const elapsed = timestamp - startTime
+    const progress = Math.min(1, elapsed / duration)
+    const eased = easeOutQuart(progress)
     wheelAngle.value = startAngle + (targetAngle - startAngle) * eased
 
     // 实时更新底部显示的名字（根据当前角度反算指针指向的扇形）
-    const currentMod2 = ((wheelAngle.value % 360) + 360) % 360
-    const pointerAngle = (360 - currentMod2 + 360) % 360
-    const idx = Math.floor(pointerAngle / sliceAngle.value) % students.value.length
-    displayName.value = students.value[idx]?.student_name || '点名中…'
+    const angleModNow = ((wheelAngle.value % 360) + 360) % 360
+    const pointerAngle = (360 - angleModNow + 360) % 360
+    const pointerIdx = Math.floor(pointerAngle / sliceAngle.value) % students.value.length
+    displayName.value = students.value[pointerIdx]?.student_name || '点名中…'
 
-    if (t < 1) {
+    if (progress < 1) {
       rafId = requestAnimationFrame(frame)
     } else {
       // 结束
@@ -125,10 +135,13 @@ function startPick() {
   rafId = requestAnimationFrame(frame)
 }
 
+/**
+ * 生成 50 片随机位置/颜色/延迟的纸屑，用于抽中后的撒花动画（2.4 秒后自动清空）
+ */
 function burstConfetti() {
   const colors = ['#2B5CE6', '#F59E0B', '#10B981', '#EF4444', '#8B5CF6', '#EC4899']
-  confettiPieces.value = Array.from({ length: 50 }).map((_, i) => ({
-    id: Date.now() + i,
+  confettiPieces.value = Array.from({ length: 50 }).map((_, pieceIndex) => ({
+    id: Date.now() + pieceIndex,
     left: Math.random() * 100,
     delay: Math.random() * 0.4,
     color: colors[Math.floor(Math.random() * colors.length)],
@@ -136,6 +149,9 @@ function burstConfetti() {
   setTimeout(() => { confettiPieces.value = [] }, 2400)
 }
 
+/**
+ * 重置转盘：停掉进行中的动画帧，清空点名历史与抽中结果，角度归零
+ */
 function resetHistory() {
   if (rafId) { cancelAnimationFrame(rafId); rafId = null }
   spinning.value = false
@@ -174,7 +190,7 @@ onMounted(loadStudents)
           :style="{ transform: `rotate(${wheelAngle}deg)` }"
         >
           <!-- 每个扇形 -->
-          <g v-for="(s, i) in students" :key="s.id">
+          <g v-for="(student, i) in students" :key="student.id">
             <path
               :d="`M0,0 L ${ 200 * Math.cos(((i * sliceAngle - 90) * Math.PI) / 180) }, ${ 200 * Math.sin(((i * sliceAngle - 90) * Math.PI) / 180) } A 200 200 0 0 1 ${ 200 * Math.cos((((i + 1) * sliceAngle - 90) * Math.PI) / 180) }, ${ 200 * Math.sin((((i + 1) * sliceAngle - 90) * Math.PI) / 180) } Z`"
               :fill="sliceColors[i % sliceColors.length]"
@@ -191,7 +207,7 @@ onMounted(loadStudents)
               font-size="16"
               font-weight="600"
               :transform="`rotate(${ i * sliceAngle + sliceAngle / 2 }, ${ 120 * Math.cos(((i * sliceAngle + sliceAngle / 2 - 90) * Math.PI) / 180) }, ${ 120 * Math.sin(((i * sliceAngle + sliceAngle / 2 - 90) * Math.PI) / 180) })`"
-            >{{ s.student_name }}</text>
+            >{{ student.student_name }}</text>
           </g>
           <!-- 中心装饰圆 -->
           <circle cx="0" cy="0" r="30" fill="#fff" stroke="#2B5CE6" stroke-width="3" />
@@ -202,10 +218,10 @@ onMounted(loadStudents)
       <!-- 彩色纸屑 -->
       <div class="confetti">
         <span
-          v-for="p in confettiPieces"
-          :key="p.id"
+          v-for="confetti in confettiPieces"
+          :key="confetti.id"
           class="confetti-piece"
-          :style="{ left: p.left + '%', background: p.color, animationDelay: p.delay + 's' }"
+          :style="{ left: confetti.left + '%', background: confetti.color, animationDelay: confetti.delay + 's' }"
         ></span>
       </div>
     </div>
@@ -239,8 +255,8 @@ onMounted(loadStudents)
     <div v-if="history.length > 0" class="history-wrap">
       <div class="history-title">本次已抽（{{ history.length }}）</div>
       <div class="history-list">
-        <span v-for="(name, i) in history" :key="name + i" class="history-chip" :class="{ crown: i === 0 }">
-          {{ i === 0 ? '👑' : '' }} {{ name }}
+        <span v-for="(name, historyIdx) in history" :key="name + historyIdx" class="history-chip" :class="{ crown: historyIdx === 0 }">
+          {{ historyIdx === 0 ? '👑' : '' }} {{ name }}
         </span>
       </div>
     </div>
