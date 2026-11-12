@@ -238,6 +238,53 @@ END;
 $$;
 
 GRANT EXECUTE ON FUNCTION public.create_teacher(text, text, text, text, uuid, uuid) TO anon, authenticated;
+-- ------------------------------------------------------------
+-- update_own_profile：用户修改自己的姓名（real_name/name）与手机号
+--   · 手机号被他人占用时经 make_unique_phone 自动生成替代号（与建号同策略），
+--     前端提示最终生效号码
+--   · 改动经 15 号触发器自动同步到 auth.users 元数据与登录手机号
+--   · email 不在此接口开放（登录名变更走管理员通道）
+-- ------------------------------------------------------------
+CREATE OR REPLACE FUNCTION public.update_own_profile(p_real_name text, p_phone text DEFAULT NULL)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = auth, public
+AS $$
+DECLARE
+    v_uid   uuid := auth.uid();
+    v_phone text := NULLIF(trim(coalesce(p_phone, '')), '');
+BEGIN
+    IF v_uid IS NULL THEN
+        RAISE EXCEPTION '未登录';
+    END IF;
+    IF p_real_name IS NULL OR trim(p_real_name) = '' THEN
+        RAISE EXCEPTION '姓名不能为空';
+    END IF;
+
+    -- 换手机号时查重：被别人占了就自动生成替代号（与 create_teacher 同策略）
+    IF v_phone IS NOT NULL THEN
+        IF EXISTS (SELECT 1 FROM auth.users au WHERE au.phone = v_phone AND au.id <> v_uid) THEN
+            v_phone := public.make_unique_phone(v_phone);
+            RAISE NOTICE '手机号已被占用，已改用 %', v_phone;
+        END IF;
+    END IF;
+
+    UPDATE public.profiles
+       SET real_name = trim(p_real_name),
+           name      = trim(p_real_name),
+           phone     = v_phone
+     WHERE id = v_uid;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION '账号档案不存在';
+    END IF;
+
+    RETURN jsonb_build_object('ok', true, 'real_name', trim(p_real_name), 'phone', v_phone);
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.update_own_profile(text, text) TO authenticated;
 
 -- 验证
 SELECT proname, prosrc IS NOT NULL AS has_body FROM pg_proc

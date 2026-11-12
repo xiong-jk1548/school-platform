@@ -13,6 +13,7 @@ import {
   Lock,
   SwitchButton,
   Refresh,
+  User,
 } from '@element-plus/icons-vue'
 
 const userStore = useUserStore()
@@ -201,6 +202,8 @@ function handleAccountCommand(command: string) {
     handleLogout()
   } else if (command === 'change-password') {
     passwordDialogVisible.value = true
+  } else if (command === 'edit-profile') {
+    openProfileDialog()
   }
 }
 
@@ -267,6 +270,51 @@ async function submitPasswordChange() {
     ElMessage.error(err instanceof Error && err.message ? err.message : '密码修改失败')
   } finally {
     passwordSubmitting.value = false
+  }
+}
+
+// ============ 修改个人信息 ============
+const profileDialogVisible = ref(false)
+const profileSubmitting = ref(false)
+const profileForm = ref({ realName: '', phone: '' })
+
+/** 打开个人信息对话框：用当前登录态预填姓名与手机号 */
+function openProfileDialog() {
+  profileForm.value.realName = userStore.name ?? ''
+  profileForm.value.phone = userStore.phone ?? ''
+  profileDialogVisible.value = true
+}
+
+/**
+ * 保存姓名/手机号：走 update_own_profile RPC（服务端校验归属与手机号唯一性），
+ * 档案变更经 15 号触发器自动同步到登录元数据。界面显示立即更新，
+ * JWT 元数据在重新登录后完全刷新。
+ */
+async function submitProfileChange() {
+  const realName = profileForm.value.realName.trim()
+  if (!realName) {
+    ElMessage.warning('姓名不能为空')
+    return
+  }
+  profileSubmitting.value = true
+  try {
+    const inputPhone = profileForm.value.phone.trim()
+    const { data, error } = await supabase.rpc('update_own_profile', {
+      p_real_name: realName,
+      p_phone: inputPhone || null,
+    })
+    if (error) throw error
+    userStore.name = realName
+    const finalPhone = (data as any)?.phone as string | null
+    if (finalPhone) userStore.phone = finalPhone
+    ElMessage.success(finalPhone && inputPhone && finalPhone !== inputPhone
+      ? `已保存。手机号与他人重复，实际生效：${finalPhone}`
+      : '个人信息已保存')
+    profileDialogVisible.value = false
+  } catch (err: unknown) {
+    ElMessage.error(err instanceof Error && err.message ? err.message : '保存失败')
+  } finally {
+    profileSubmitting.value = false
   }
 }
 
@@ -406,6 +454,10 @@ function handleRoleSwitch(role: 'sys_admin' | 'school_admin' | 'teacher') {
                   <el-icon><Lock /></el-icon>
                   修改密码
                 </el-dropdown-item>
+                <el-dropdown-item :command="'edit-profile'">
+                  <el-icon><User /></el-icon>
+                  修改个人信息
+                </el-dropdown-item>
                 <el-dropdown-item divided v-if="roleSwitchOptions.length > 1">
                   <el-dropdown trigger="hover" placement="right-start">
                     <div class="role-switch-entry">
@@ -482,6 +534,33 @@ function handleRoleSwitch(role: 'sys_admin' | 'school_admin' | 'teacher') {
         <el-button @click="passwordDialogVisible = false">取消</el-button>
         <el-button type="primary" :loading="passwordSubmitting" @click="submitPasswordChange">
           确定修改
+        </el-button>
+      </template>
+    </el-dialog>
+
+    <!-- 修改个人信息对话框 -->
+    <el-dialog
+      v-model="profileDialogVisible"
+      title="修改个人信息"
+      width="420px"
+      :close-on-click-modal="false"
+      destroy-on-close
+    >
+      <el-form label-width="90px">
+        <el-form-item label="姓名">
+          <el-input v-model="profileForm.realName" placeholder="显示在头像与顶栏的名字" maxlength="20" />
+        </el-form-item>
+        <el-form-item label="手机号">
+          <el-input v-model="profileForm.phone" placeholder="用于手机号登录" maxlength="20" />
+        </el-form-item>
+        <el-form-item label=" ">
+          <span class="profile-save-hint">保存后立即生效；手机号登录在下次登录时使用新号码</span>
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="profileDialogVisible = false">取消</el-button>
+        <el-button type="primary" :loading="profileSubmitting" @click="submitProfileChange">
+          保存
         </el-button>
       </template>
     </el-dialog>
@@ -577,6 +656,11 @@ function handleRoleSwitch(role: 'sys_admin' | 'school_admin' | 'teacher') {
   color: #303133;
 }
 
+.profile-save-hint {
+  font-size: 12px;
+  color: #909399;
+  line-height: 1.4;
+}
 .page-viewport {
   background: #f5f7fa;
   padding: 20px;

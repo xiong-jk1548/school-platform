@@ -33,8 +33,15 @@ BEGIN
                   'role',       NEW.role,
                   'school_id',  NEW.school_id::text,
                   'class_id',   NEW.class_id::text,
-                  'class_name', NEW.class_name
-              )
+                  'class_name', NEW.class_name,
+                  'real_name',  NEW.real_name,
+                  'name',       NEW.real_name,
+                  'phone',      NEW.phone
+              ),
+           -- 手机号同步到登录凭据本体：手机号登录用的号码跟随档案
+           phone = COALESCE(NEW.phone, u.phone),
+           phone_confirmed_at = CASE WHEN NEW.phone IS NOT NULL AND NEW.phone <> u.phone
+                                     THEN now() ELSE u.phone_confirmed_at END
      WHERE u.id = NEW.id;
     RETURN NEW;
 EXCEPTION
@@ -48,7 +55,7 @@ $$;
 
 DROP TRIGGER IF EXISTS trg_profiles_sync_metadata ON public.profiles;
 CREATE TRIGGER trg_profiles_sync_metadata
-    AFTER UPDATE OF class_id, class_name, role, school_id ON public.profiles
+    AFTER UPDATE OF class_id, class_name, role, school_id, real_name, name, phone ON public.profiles
     FOR EACH ROW
     EXECUTE FUNCTION public.trg_profiles_sync_metadata();
 
